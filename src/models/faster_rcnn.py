@@ -2,7 +2,7 @@ import torch
 import time
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet
+from torchvision.models import resnet, vgg16
 from torchvision.models.utils import load_state_dict_from_url
 import torchvision.ops as ops
 import numpy as np
@@ -37,7 +37,7 @@ class ResNetWrapper(resnet.ResNet):
         self.load_state_dict(load_state_dict_from_url(resnet.model_urls[arch]))
 
 
-class FeatureNet(ResNetWrapper):
+class FeatureNetResNet(ResNetWrapper):
     def __init__(self, arch='resnet18'):
         super().__init__(arch)
         del self.avgpool
@@ -60,30 +60,7 @@ class FeatureNet(ResNetWrapper):
         return x
 
 
-class RegionProposalNetwork(nn.Module):
-    def __init__(self, num_anchors, in_channels, mid_channels=512):
-        super().__init__()
-        self.num_anchors = num_anchors
-
-        self.conv1 = nn.Conv2d(in_channels, mid_channels, 3, 1, 1)
-        self.conv_loc = nn.Conv2d(mid_channels, num_anchors * 4, 1, 1, 0)
-        self.conv_obj = nn.Conv2d(mid_channels, num_anchors * 2, 1, 1, 0)
-
-        self.conv1.weight.data.normal_(0, 0.01)
-        self.conv1.bias.data.zero_()
-        self.conv_loc.weight.data.normal_(0, 0.01)
-        self.conv_loc.bias.data.zero_()
-        self.conv_obj.weight.data.normal_(0, 0.01)
-        self.conv_obj.bias.data.zero_()
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        pred_loc = self.conv_loc(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
-        pred_obj = self.conv_obj(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 2)
-        return pred_loc, pred_obj
-
-
-class Head(ResNetWrapper):
+class HeadResNet(ResNetWrapper):
     def __init__(self, num_classes, arch='resnet18'):
         super().__init__(arch)
         self.roi_align_size = (7, 7)
@@ -114,7 +91,10 @@ class Head(ResNetWrapper):
         pred_indices_and_boxes = torch.from_numpy(pred_indices_and_boxes).to(x)
 
         # TODO write my own roi_align or roi_pool layer
-        regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
+        # regions = ops.roi_pool(x, pred_indices_and_boxes.transpose(0, 2, 1, 4, 3), self.roi_align_size, self.spatial_scale)
+        # regions = ops.roi_align(x, pred_indices_and_boxes.transpose(0, 2, 1, 4, 3), self.roi_align_size, self.spatial_scale)
+        regions = ops.roi_pool(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
+        # regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
         y = self.avgpool(self.layer4(regions))
         y = torch.flatten(y, start_dim=1)
 
@@ -122,6 +102,86 @@ class Head(ResNetWrapper):
         pred_roi_loc = self.fc_loc(y).view(num_regions, -1, 4)
 
         return pred_roi_cls, pred_roi_loc
+
+
+class FeatureNetVGG16(nn.Module):
+    def __init__(self):
+        super().__init__()
+        model = vgg16(pretrained=True)
+        features = list(model.features)[:30]
+        for layer in features[:10]:
+            for p in layer.parameters():
+                p.requires_grad = False
+
+        self.features = nn.Sequential(*features)
+
+    def get_out_channels(self):
+        return 512
+
+    def forward(self, x):
+        x = self.features(x)
+        return x
+
+
+class HeadVGG16(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.roi_align_size = (7, 7)
+        self.spatial_scale = 1.0 / 16.0
+
+        model = vgg16(pretrained=True)
+        classifier = model.classifier
+        classifier = list(classifier)
+        del classifier[6]
+        del classifier[5]
+        del classifier[2]
+        self.classifier = nn.Sequential(*classifier)
+
+        self.fc_loc = nn.Linear(4096, num_classes * 4)
+        self.fc_cls = nn.Linear(4096, num_classes)
+
+        self.fc_loc.weight.data.normal_(0, 0.01)
+        self.fc_loc.bias.data.zero_()
+        self.fc_cls.weight.data.normal_(0, 0.01)
+        self.fc_cls.bias.data.zero_()
+
+    def forward(self, x, pred_boxes, pred_batch_idx):
+        num_regions = len(pred_batch_idx)
+
+        pred_indices_and_boxes = np.concatenate((pred_batch_idx.reshape(-1, 1), pred_boxes), axis=1)
+        pred_indices_and_boxes = torch.from_numpy(pred_indices_and_boxes).to(x)
+
+        # TODO write my own roi_align or roi_pool layer
+        regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
+        y = self.classifier(torch.flatten(regions, start_dim=1))
+
+        pred_roi_cls = self.fc_cls(y)
+        pred_roi_loc = self.fc_loc(y).view(num_regions, -1, 4)
+
+        return pred_roi_cls, pred_roi_loc
+
+
+class RegionProposalNetwork(nn.Module):
+    def __init__(self, num_anchors, in_channels, mid_channels=512):
+        super().__init__()
+        self.num_anchors = num_anchors
+
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, 3, 1, 1)
+        self.conv_loc = nn.Conv2d(mid_channels, num_anchors * 4, 1, 1, 0)
+        self.conv_obj = nn.Conv2d(mid_channels, num_anchors * 2, 1, 1, 0)
+
+        self.conv1.weight.data.normal_(0, 0.01)
+        self.conv1.bias.data.zero_()
+        self.conv_loc.weight.data.normal_(0, 0.01)
+        self.conv_loc.bias.data.zero_()
+        self.conv_obj.weight.data.normal_(0, 0.01)
+        self.conv_obj.bias.data.zero_()
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        pred_loc = self.conv_loc(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
+        pred_obj = self.conv_obj(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 2)
+        return pred_loc, pred_obj
 
 
 def get_boxes_from_loc2(anchor_boxes, loc, img_width, img_height, loc_mean=None, loc_std=None):
@@ -276,6 +336,10 @@ class TrainingProposalSelector:
             batch_pred_boxes = pred_boxes[pred_batch_idx == batch, :]
             batch_gt_boxes = gt_boxes[batch, :gt_count[batch], :]
             batch_gt_class_labels = gt_class_labels[batch, :gt_count[batch]]
+
+            # include ground truth boxes
+            batch_pred_boxes = np.concatenate((batch_pred_boxes, batch_gt_boxes), axis=0)
+
             if gt_count[batch] > 0:
                 iou = compute_iou(batch_pred_boxes, batch_gt_boxes)
                 max_iou_gt_idx = np.argmax(iou, axis=1)
@@ -334,14 +398,20 @@ class TrainingProposalSelector:
 class FasterRCNN(nn.Module):
     def __init__(self, anchor_boxes, num_anchors=9, num_classes=92, return_rpn_output=False):
         super().__init__()
-        arch = 'resnet18'
         self.return_rpn_output = return_rpn_output
-        self.feature_net = FeatureNet(arch)
+
+        # TODO get resnet architecture working
+        # arch = 'resnet18'
+        # self.feature_net = FeatureNetResNet(arch)
+        self.feature_net = FeatureNetVGG16()
+
         self.region_proposal_network = RegionProposalNetwork(
             num_anchors, self.feature_net.get_out_channels())
         self.preprocess_head = PreprocessHead(anchor_boxes)
         self.training_proposal_selector = TrainingProposalSelector()
-        self.head = Head(num_classes, arch)
+
+        # self.head = HeadResNet(num_classes, arch)
+        self.head = HeadVGG16(num_classes)
 
     def forward(self, x, gt_boxes=None, gt_class_labels=None, gt_count=None):
         if self.training:

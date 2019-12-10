@@ -184,9 +184,39 @@ coco_names = [
     'wood'
 ]
 
+voc_names = [
+    '__unlabeled__',
+    'aeroplane',
+    'bicycle',
+    'bird',
+    'boat',
+    'bottle',
+    'bus',
+    'car',
+    'cat',
+    'chair',
+    'cow',
+    'diningtable',
+    'dog',
+    'horse',
+    'motorbike',
+    'person',
+    'pottedplant',
+    'sheep',
+    'sofa',
+    'train',
+    'tvmonitor'
+]
+
 coco_id_to_name = {index: name for index, name in enumerate(coco_names)}
 coco_name_to_id = {name: index for index, name in enumerate(coco_names)}
 
 # including __unlabled__ and removed labels
 coco_num_obj_classes = 92
 coco_num_all_classes = len(coco_names)
+
+voc_id_to_name = {index: name for index, name in enumerate(voc_names)}
+voc_name_to_id = {name: index for index, name in enumerate(voc_names)}
+
+# including __unlabled__
+voc_num_obj_classes = len(voc_names)
