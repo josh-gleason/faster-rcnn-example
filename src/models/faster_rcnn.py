@@ -1,12 +1,11 @@
 import torch
-import time
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet, vgg16
 from torchvision.models.utils import load_state_dict_from_url
 import torchvision.ops as ops
 import numpy as np
-from utils.box_utils import compute_iou, choose_anchor_subset, get_loc_labels, get_boxes_from_loc, apply_nms
+from utils.box_utils import compute_iou, choose_anchor_subset, get_loc_labels
 
 
 class ResNetWrapper(resnet.ResNet):
@@ -413,7 +412,7 @@ class FasterRCNN(nn.Module):
         # self.head = HeadResNet(num_classes, arch)
         self.head = HeadVGG16(num_classes)
 
-    def forward(self, x, gt_boxes=None, gt_class_labels=None, gt_count=None):
+    def forward(self, x, initial_batch_idx, gt_boxes=None, gt_class_labels=None, gt_count=None):
         if self.training:
             assert gt_boxes is not None and gt_count is not None and gt_class_labels is not None
 
@@ -434,6 +433,9 @@ class FasterRCNN(nn.Module):
 
         pred_roi_boxes = torch.from_numpy(pred_roi_boxes).to(device=x.device)
         pred_roi_batch_idx = torch.from_numpy(pred_roi_batch_idx).to(device=x.device)
+
+        # local batch indicies may differ from original with DataParallel, need to map them
+        pred_roi_batch_idx = initial_batch_idx[pred_roi_batch_idx]
 
         output = {
             'pred_roi_batch_idx': pred_roi_batch_idx,

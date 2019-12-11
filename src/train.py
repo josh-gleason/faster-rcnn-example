@@ -31,7 +31,7 @@ parser.add_argument('--voc-root', '-vr', default='../pascal_voc', type=str,
                     help='Root directory of Pascal VOC dataset')
 parser.add_argument('--train-batch-size', '-b', default=1, type=int,
                     help='Training batch size')
-parser.add_argument('--test-batch-size', '-tb', default=2, type=int,
+parser.add_argument('--test-batch-size', '-tb', default=16, type=int,
                     help='Test batch size')
 parser.add_argument('--num-workers', '-j', default=8, type=int,
                     help='Number of workers')
@@ -41,9 +41,9 @@ parser.add_argument('--momentum', '-m', default=0.9, type=float,
                     help='Momentum for SGD')
 parser.add_argument('--weight-decay', '-wd', default=1e-5, type=float,
                     help='Weight decay parameter for SGD')
-parser.add_argument('--num-epochs', '-ne', default=20, type=int,
+parser.add_argument('--num-epochs', '-ne', default=15, type=int,
                     help='Number of epochs')
-parser.add_argument('--lr-step-freq', '-s', default=5, type=int,
+parser.add_argument('--lr-step-freq', '-s', default=9, type=int,
                     help='How many epochs before reducing learning rate')
 parser.add_argument('--lr-step-gamma', '-g', default=0.1, type=float,
                     help='How much to scale learning rate on step')
@@ -57,6 +57,8 @@ parser.add_argument('--resume', '-r', default='', type=str,
                     help='Resume from this checkpoint if provided')
 parser.add_argument('--use-adam', '-a', action='store_true',
                     help='If this flag is provided then use Adam optimizer, otherwise use SGD')
+parser.add_argument('--validate', '-v', action='store_true',
+                    help='If this flag is provided then only perform validation and don\'t train')
 args = parser.parse_args()
 
 
@@ -231,8 +233,8 @@ def faster_rcnn_collate_fn(batch):
     gt_boxes = [pad_zero_rows(b[1][2], gt_max_count) for b in batch]
     gt_class_labels = [pad_zero_rows(b[1][3], gt_max_count) for b in batch]
 
-    batch = [(b[0], (b[1][0], b[1][1], boxes, labels, counts))
-             for b, boxes, labels, counts in zip(batch, gt_boxes, gt_class_labels, gt_count)]
+    batch = [(b[0], (b[1][0], b[1][1], boxes, labels, counts, batch_idx))
+             for batch_idx, (b, boxes, labels, counts) in enumerate(zip(batch, gt_boxes, gt_class_labels, gt_count))]
     return torch.utils.data.dataloader.default_collate(batch)
 
 
@@ -302,7 +304,8 @@ def load_datasets(sub_sample, resize_shape):
         sampler=train_sampler,
         num_workers=args.num_workers,
         drop_last=True,
-        collate_fn=faster_rcnn_collate_fn
+        collate_fn=faster_rcnn_collate_fn,
+        pin_memory=True
     )
 
     val_loader = torch.utils.data.DataLoader(
@@ -311,7 +314,8 @@ def load_datasets(sub_sample, resize_shape):
         shuffle=False,
         num_workers=args.num_workers,
         drop_last=True,
-        collate_fn=faster_rcnn_collate_fn
+        collate_fn=faster_rcnn_collate_fn,
+        pin_memory=True
     )
 
     return train_loader, val_loader, anchor_boxes, num_classes
@@ -466,15 +470,15 @@ class FasterRCNNCriterion(nn.Module):
         return torch.sum(loss) / float(batch_size)
 
 
-def get_display_boxes(output, top3=False):
+def get_display_boxes(output, batch_idx=0, top3=False):
     pred_roi_cls = torch.softmax(output['pred_roi_cls'], dim=1).detach().cpu().numpy()
     pred_roi_batch_idx = output['pred_roi_batch_idx'].detach().cpu().numpy()
     pred_roi_boxes = output['pred_roi_boxes'].detach().cpu().numpy()
     pred_roi_loc = output['pred_roi_loc'].detach().cpu().numpy()
 
-    pred_roi_cls = pred_roi_cls[pred_roi_batch_idx == 0]
-    pred_roi_boxes = pred_roi_boxes[pred_roi_batch_idx == 0, :]
-    pred_roi_loc = pred_roi_loc[pred_roi_batch_idx == 0, :]
+    pred_roi_cls = pred_roi_cls[pred_roi_batch_idx == batch_idx]
+    pred_roi_boxes = pred_roi_boxes[pred_roi_batch_idx == batch_idx, :]
+    pred_roi_loc = pred_roi_loc[pred_roi_batch_idx == batch_idx, :]
 
     pred_cls = np.argmax(pred_roi_cls, axis=1)
     pred_conf = np.max(pred_roi_cls, axis=1)
@@ -505,7 +509,7 @@ def get_display_boxes(output, top3=False):
 
             cls_rects = torch.from_numpy(cls_rects).float()
             cls_conf = torch.from_numpy(cls_conf).float()
-            keep_nms = ops.nms(cls_rects, cls_conf, 0.5)
+            keep_nms = ops.nms(cls_rects, cls_conf, 0.3)
             post_nms_rects.append(cls_rects[keep_nms].numpy())
             post_nms_confs.append(cls_conf[keep_nms].numpy())
             post_nms_labels.append(np.full(len(keep_nms), cls, dtype=np.int32))
@@ -542,14 +546,15 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
     roi_cls_loss_avg = AverageMeter()
     roi_loc_loss_avg = AverageMeter()
     with tqdm(total=len(train_loader), ncols=0, desc='Training Epoch {}'.format(epoch)) as pbar:
-        for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels, gt_count)) in enumerate(train_loader):
+        for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels, gt_count, initial_batch_idx)) in enumerate(train_loader):
             data = data.cuda()
             anchor_obj = anchor_obj.cuda()
             anchor_loc = anchor_loc.cuda()
             gt_boxes = gt_boxes.cuda()
             gt_class_labels = gt_class_labels.cuda()
+            initial_batch_idx = initial_batch_idx.cuda()
 
-            output = model(data, gt_boxes, gt_class_labels, gt_count)
+            output = model(data, initial_batch_idx, gt_boxes, gt_class_labels, gt_count)
             loss, rpn_obj_loss, rpn_loc_loss, roi_cls_loss, roi_loc_loss \
                 = criterion(**output, anchor_obj=anchor_obj, anchor_loc=anchor_loc)
 
@@ -563,13 +568,18 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
             loss_scaled = loss / float(args.batches_per_optimizer_step)
             loss_scaled.backward()
 
+            if (batch_num + 1) % args.batches_per_optimizer_step == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+
             if batch_num % 50 == 0:
                 img = tvtf.to_pil_image(torch.clamp(data[0, :, :, :] * 0.5 + 0.5, 0, 1).cpu())
 
-                model.eval()
-                test_img = data[0:1, :, :, :]
-                output = model(test_img)
-                model.train()
+                with torch.no_grad():
+                    model.eval()
+                    test_img = data[0:1, :, :, :]
+                    output = model(test_img, torch.tensor((0,)).to(device=test_img.device))
+                    model.train()
 
                 rect_list, text_list = get_display_boxes(output, top3=True)
                 pred_img = draw_detections(img, rect_list, text_list)
@@ -582,15 +592,37 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
                 writer.add_scalar('Loss {}/train roi_cls_loss'.format(epoch), roi_cls_loss_avg.avg, batch_num)
                 writer.add_scalar('Loss {}/train roi_loc_loss'.format(epoch), roi_loc_loss_avg.avg, batch_num)
 
-            if (batch_num + 1) % args.batches_per_optimizer_step == 0:
-                optimizer.step()
-                optimizer.zero_grad()
             pbar.update()
 
 
 def validate(writer, model, val_loader):
-    # TODO
-    pass
+    # TODO this doesnt actually do validation right now it just shows some example images in tensorboard
+    num_shown_examples = 10
+
+    model.eval()
+    with torch.no_grad():
+        with tqdm(total=len(val_loader), ncols=0, desc='Validation') as pbar:
+            mean_avg_precision = 0.
+            shown_examples = 0
+            for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels, gt_count, data_batch_idx)) in enumerate(val_loader):
+                data = data.cuda()
+                data_batch_idx = data_batch_idx.cuda()
+                output = model(data, data_batch_idx)
+                batch_size = data.shape[0]
+                for batch_idx in range(batch_size):
+                    if shown_examples >= num_shown_examples:
+                        break
+                    img = tvtf.to_pil_image(torch.clamp(data[batch_idx, :, :, :] * 0.5 + 0.5, 0, 1).cpu())
+
+                    rect_list, text_list = get_display_boxes(output, batch_idx)
+                    pred_img = draw_detections(img, rect_list, text_list)
+
+                    writer.add_image('Images/val example {}'.format(shown_examples), tvtf.to_tensor(pred_img))
+                    shown_examples += 1
+
+                pbar.update()
+
+    return mean_avg_precision
 
 
 def main(writer):
@@ -621,19 +653,25 @@ def main(writer):
     if args.resume:
         start_epoch, best_map = load_checkpoint(model, criterion, optimizer, lr_scheduler)
 
+    # validate only if indicated
+    if args.validate:
+        validate(writer, model, val_loader)
+        return
+
     # train
     for epoch in range(start_epoch, args.num_epochs):
         train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_loader)
-        # TODO
-        # validate_map = validate(writer, model, val_loader)
-        # is_best = validate_map > best_map
-        # if is_best:
-        #     print("This is the best mAP score so far!")
-        #     best_map = validate_map
+        lr_scheduler.step()
+
+        validate_map = validate(writer, model, val_loader)
+        is_best = validate_map > best_map
+        if is_best:
+            print("This is the best mAP score so far!")
+            best_map = validate_map
+
         best_map = 0
         is_best = False
         save_checkpoint(model, criterion, optimizer, lr_scheduler, epoch, best_map, is_best)
-        lr_scheduler.step()
 
 
 if __name__ == '__main__':
