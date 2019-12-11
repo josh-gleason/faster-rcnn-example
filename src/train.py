@@ -18,7 +18,7 @@ from torchvision import transforms as tvt
 import torchvision.transforms.functional as tvtf
 
 from utils.data_mappings import coco_num_obj_classes, coco_id_to_name, voc_num_obj_classes, voc_name_to_id, voc_id_to_name
-from utils.box_utils import compute_iou, choose_anchor_subset, get_loc_labels, define_anchor_boxes, get_boxes_from_loc, apply_nms
+from utils.box_utils import compute_iou, choose_anchor_subset, get_loc_labels, define_anchor_boxes, get_boxes_from_loc
 from utils.image_utils import draw_detections
 from models.faster_rcnn import FasterRCNN
 
@@ -59,25 +59,104 @@ parser.add_argument('--use-adam', '-a', action='store_true',
                     help='If this flag is provided then use Adam optimizer, otherwise use SGD')
 parser.add_argument('--validate', '-v', action='store_true',
                     help='If this flag is provided then only perform validation and don\'t train')
+parser.add_argument('--print-freq', '-pf', default=100, type=int,
+                    help='Indicates how many batches to wait before updating tensorboard')
+parser.add_argument('--quick-validate', '-qv', action='store_true',
+                    help='Skip mAP and only evaluate the first 10 validation images to tensorboard')
 args = parser.parse_args()
 
 
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self):
+class AverageMeter:
+    def __init__(self, alpha=None, drop_first=False):
+        """
+        Keeps a running total with optionally limited memory. This is known as exponential smoothing. Some math
+        is provided to help you choose alpha.
+
+        Average calculated as
+            running_average = alpha*running_average + (1-alpha)*sample
+
+        Assuming each sample is IID with mean mu and standard deviation sigma, then after sufficient time has passed
+        the mean of the average meter will be mu and the standard deviation is sigma*sqrt((1-alpha)/(1+alpha)). Based
+        on this, if we want the standard deviation of the average to be sigma*(1/N) for some N then we should choose
+        alpha=(N**2-1)/(N**2+1).
+
+        The time constant (tau) of an exponential filter is the number of updates before the average meter is expected
+        to reach (1 - 1/e) * mu = 0.632 * mu when initialized with running_average=0. This can be thought of as the
+        delay in the filter. It's relation to alpha is alpha = exp(-1/tau). Note that this meter initializes
+        running_average with the first sample value, rather than 0, so in reality the expected value of the average
+        meter is always mu (still assuming IID). In a real system the average may be a non-stationary statistics (for
+        example training loss) so choosing a alpha with a reasonable time constant is still important.
+
+        Some reasonable values for alpha
+
+        alpha = 0.9 results in
+            sigma = 0.23 * sigma
+            tau = 10
+
+        alpha = 0.98 results in
+            sigma_meter = 0.1 * sigma
+            tau = 50
+
+        alpha = 0.995 results in
+            sigma_meter = 0.05 * sigma
+            tau = 200
+
+        Args
+            alpha (None or float): Range 0 < alpha < 1. The closer to 1 the more accurate the estimate but
+                the more delayed the estimate. If None the average meter simply keeps a running total and returns
+                the current average.
+            drop_first (bool): If True then ignore the first call to update. Useful in, for example, measuring data
+                loading times since the first call to the loader takes much longer than subsequent calls.
+        """
+        self._alpha = alpha
+        self._drop_first = drop_first
+
+        self._first = None
+        self._value = None
+        self._running_value = None
+        self._count = None
         self.reset()
 
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
+    def update(self, value, batch_size=1):
+        if self._drop_first and self._first:
+            self._first = False
+            return
 
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
+        if self._alpha is not None:
+            self._value = value
+            w = self._alpha ** batch_size
+            self._running_value = w * self._running_value + (1.0 - w) * value \
+                if self._running_value is not None else value
+        else:
+            self._value = value
+            if self._running_value is not None:
+                self._running_value += self._value * batch_size
+            else:
+                self._running_value = self._value * batch_size
+            self._count += batch_size
+
+    @property
+    def average(self):
+        if self._alpha is not None:
+            return self._running_value if self._running_value is not None else 0.0
+        elif self._running_value is None:
+            return 0
+        else:
+            return self._running_value / self._count if self._count > 0 else 0.0
+
+    @property
+    def value(self):
+        return self._value if self._value is not None else 0
+
+    @property
+    def count(self):
+        return self._count
+
+    def reset(self):
+        self._value = None
+        self._running_value = None
+        self._count = 0
+        self._first = True
 
 
 def remove_duplicate_anchors(anchor_index, gt_index, iou):
@@ -540,11 +619,11 @@ def get_display_boxes(output, batch_idx=0, top3=False):
 def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_loader):
     model.train()
     optimizer.zero_grad()
-    loss_avg = AverageMeter()
-    rpn_obj_loss_avg = AverageMeter()
-    rpn_loc_loss_avg = AverageMeter()
-    roi_cls_loss_avg = AverageMeter()
-    roi_loc_loss_avg = AverageMeter()
+    loss_avg = AverageMeter(0.998)
+    rpn_obj_loss_avg = AverageMeter(0.998)
+    rpn_loc_loss_avg = AverageMeter(0.998)
+    roi_cls_loss_avg = AverageMeter(0.998)
+    roi_loc_loss_avg = AverageMeter(0.998)
     with tqdm(total=len(train_loader), ncols=0, desc='Training Epoch {}'.format(epoch)) as pbar:
         for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels, gt_count, initial_batch_idx)) in enumerate(train_loader):
             data = data.cuda()
@@ -572,7 +651,7 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
                 optimizer.step()
                 optimizer.zero_grad()
 
-            if batch_num % 50 == 0:
+            if batch_num % args.print_freq == 0:
                 img = tvtf.to_pil_image(torch.clamp(data[0, :, :, :] * 0.5 + 0.5, 0, 1).cpu())
 
                 with torch.no_grad():
@@ -586,22 +665,23 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
 
                 writer.add_image('Images/train_{}'.format(epoch), tvtf.to_tensor(pred_img))
 
-                writer.add_scalar('Loss {}/train loss'.format(epoch), loss_avg.avg, batch_num)
-                writer.add_scalar('Loss {}/train rpn_obj_loss'.format(epoch), rpn_obj_loss_avg.avg, batch_num)
-                writer.add_scalar('Loss {}/train rpn_loc_loss'.format(epoch), rpn_loc_loss_avg.avg, batch_num)
-                writer.add_scalar('Loss {}/train roi_cls_loss'.format(epoch), roi_cls_loss_avg.avg, batch_num)
-                writer.add_scalar('Loss {}/train roi_loc_loss'.format(epoch), roi_loc_loss_avg.avg, batch_num)
+                writer.add_scalar('Loss {}/train loss'.format(epoch), loss_avg.average, batch_num)
+                writer.add_scalar('Loss {}/train rpn_obj_loss'.format(epoch), rpn_obj_loss_avg.average, batch_num)
+                writer.add_scalar('Loss {}/train rpn_loc_loss'.format(epoch), rpn_loc_loss_avg.average, batch_num)
+                writer.add_scalar('Loss {}/train roi_cls_loss'.format(epoch), roi_cls_loss_avg.average, batch_num)
+                writer.add_scalar('Loss {}/train roi_loc_loss'.format(epoch), roi_loc_loss_avg.average, batch_num)
 
             pbar.update()
 
 
-def validate(writer, model, val_loader):
+def validate(writer, model, val_loader, stop_after_examples=False):
     # TODO this doesnt actually do validation right now it just shows some example images in tensorboard
     num_shown_examples = 10
 
     model.eval()
     with torch.no_grad():
-        with tqdm(total=len(val_loader), ncols=0, desc='Validation') as pbar:
+        total = min(int(num_shown_examples // args.test_batch_size), len(val_loader)) if stop_after_examples else len(val_loader)
+        with tqdm(total=total, ncols=0, desc='Validation') as pbar:
             mean_avg_precision = 0.
             shown_examples = 0
             for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels, gt_count, data_batch_idx)) in enumerate(val_loader):
@@ -611,6 +691,9 @@ def validate(writer, model, val_loader):
                 batch_size = data.shape[0]
                 for batch_idx in range(batch_size):
                     if shown_examples >= num_shown_examples:
+                        if stop_after_examples:
+                            pbar.update()
+                            return 0.
                         break
                     img = tvtf.to_pil_image(torch.clamp(data[batch_idx, :, :, :] * 0.5 + 0.5, 0, 1).cpu())
 
@@ -655,7 +738,7 @@ def main(writer):
 
     # validate only if indicated
     if args.validate:
-        validate(writer, model, val_loader)
+        validate(writer, model, val_loader, stop_after_examples=args.quick_validate)
         return
 
     # train
@@ -663,7 +746,7 @@ def main(writer):
         train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_loader)
         lr_scheduler.step()
 
-        validate_map = validate(writer, model, val_loader)
+        validate_map = validate(writer, model, val_loader, stop_after_examples=args.quick_validate)
         is_best = validate_map > best_map
         if is_best:
             print("This is the best mAP score so far!")
@@ -676,7 +759,7 @@ def main(writer):
 
 if __name__ == '__main__':
     datestr = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tensorboard_dir = '../tensorboard/' + datestr
+    tensorboard_dir = '../tensorboard/' + args.dataset + '_' + datestr
     print('Writing tensorboard output to', tensorboard_dir)
     writer = SummaryWriter(tensorboard_dir)
     try:

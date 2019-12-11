@@ -432,7 +432,7 @@ class FasterRCNN(nn.Module):
         pred_roi_cls, pred_roi_loc = self.head(x, pred_roi_boxes, pred_roi_batch_idx)
 
         pred_roi_boxes = torch.from_numpy(pred_roi_boxes).to(device=x.device)
-        pred_roi_batch_idx = torch.from_numpy(pred_roi_batch_idx).to(device=x.device)
+        pred_roi_batch_idx = torch.from_numpy(pred_roi_batch_idx).to(device=x.device, dtype=torch.long)
 
         # local batch indicies may differ from original with DataParallel, need to map them
         pred_roi_batch_idx = initial_batch_idx[pred_roi_batch_idx]

@@ -9,7 +9,7 @@ def compute_iou(boxes1, boxes2):
     int_right_bot = np.minimum(boxes1[:, 2:].reshape(-1, 1, 2), boxes2[:, 2:])
     int_width_height = np.maximum(0, int_right_bot - int_left_top)
     int_areas = np.prod(int_width_height, axis=2)
-    union_areas = boxes1_areas + boxes2_areas - int_areas
+    union_areas = np.maximum(1e-6, boxes1_areas + boxes2_areas - int_areas)
 
     return int_areas / union_areas
 
