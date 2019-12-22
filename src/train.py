@@ -181,12 +181,16 @@ def save_checkpoint(model, criterion, optimizer, lr_scheduler, epoch, best_map, 
         'lr_scheduler.state_dict': lr_scheduler.state_dict(),
         'epoch': epoch + 1,
         'best_map': best_map}
-    os.makedirs(os.path.dirname(checkpoint_name), exist_ok=True)
+    out_dir = os.path.dirname(checkpoint_name)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     torch.save(checkpoint, checkpoint_name)
     print('Finished saving checkpoint', checkpoint_name)
     if is_best:
         best_checkpoint_name = args.best_checkpoint_format.format(epoch=epoch, best_map=best_map)
-        os.makedirs(os.path.dirname(best_checkpoint_name), exist_ok=True)
+        out_dir = os.path.dirname(best_checkpoint_name)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         print('Copying', checkpoint_name, 'to', best_checkpoint_name)
         shutil.copyfile(checkpoint_name, best_checkpoint_name)
         print('Finished copying to', best_checkpoint_name)
