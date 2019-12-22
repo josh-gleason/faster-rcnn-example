@@ -1,5 +1,8 @@
 import numpy as np
 import time
+import torch
+from collections import defaultdict
+from torchvision import ops
 
 
 def compute_iou(boxes1, boxes2):
@@ -196,3 +199,96 @@ def apply_nms(boxes, scores, threshold, n_results=-1, return_scores=False):
     print('build output', time.time() - t0)
 
     return output
+
+
+def get_bboxes_from_output(output, resized_shapes, orig_shapes, threshold=0.0):
+    all_pred_roi_cls = torch.softmax(output['pred_roi_cls'], dim=1).detach().cpu().numpy()
+    all_pred_roi_batch_idx = output['pred_roi_batch_idx'].detach().cpu().numpy()
+    all_pred_roi_boxes = output['pred_roi_boxes'].detach().cpu().numpy()
+    all_pred_roi_loc = output['pred_roi_loc'].detach().cpu().numpy()
+
+    final_preds = []
+    batch_indices = np.sort(np.unique(all_pred_roi_batch_idx))
+    for batch_idx in batch_indices:
+        resized_shape = resized_shapes[batch_idx]
+        orig_shape = orig_shapes[batch_idx]
+
+        pred_roi_cls = all_pred_roi_cls[all_pred_roi_batch_idx == batch_idx]
+        pred_roi_boxes = all_pred_roi_boxes[all_pred_roi_batch_idx == batch_idx, :]
+        pred_roi_loc = all_pred_roi_loc[all_pred_roi_batch_idx == batch_idx, :]
+
+        pred_cls = np.argmax(pred_roi_cls, axis=1)
+        pred_conf = np.max(pred_roi_cls, axis=1)
+        keep_idx = np.nonzero(pred_cls > 0)[0]
+
+        final_preds.append(defaultdict(lambda: {'rects': [], 'confs': []}))
+        if len(keep_idx) > 0:
+            pred_cls = pred_cls[keep_idx]
+            pred_conf = pred_conf[keep_idx]
+            pred_boxes = pred_roi_boxes[keep_idx]
+            pred_loc = pred_roi_loc[keep_idx, pred_cls, :]
+
+            rects = get_boxes_from_loc(pred_boxes, pred_loc,
+                                       img_width=resized_shape[0], img_height=resized_shape[1],
+                                       loc_mean=np.array((0., 0., 0., 0.)),
+                                       loc_std=np.array((0.1, 0.1, 0.2, 0.2)),
+                                       orig_width=orig_shape[0], orig_height=orig_shape[1])
+            pre_nms = defaultdict(list)
+            for rect, conf, cls in zip(rects, pred_conf, pred_cls):
+                if cls > 0:
+                    pre_nms[cls].append((rect, conf))
+
+            for cls in pre_nms:
+                cls_rects, cls_conf = zip(*pre_nms[cls])
+                cls_rects = np.concatenate([c.reshape(1, -1) for c in cls_rects], axis=0)
+                cls_conf = np.array(cls_conf)
+
+                cls_rects = torch.from_numpy(cls_rects).float()
+                cls_conf = torch.from_numpy(cls_conf).float()
+                keep_nms = ops.nms(cls_rects.cuda(), cls_conf.cuda(), 0.3).cpu()
+                keep_nms = keep_nms[np.nonzero(cls_conf[keep_nms].numpy() >= threshold)[0]]
+
+                if len(keep_nms) > 0:
+                    final_preds[-1][cls]['rects'] = cls_rects[keep_nms].numpy()
+                    final_preds[-1][cls]['confs'] = cls_conf[keep_nms].numpy()
+
+    return final_preds, batch_indices
+
+
+def get_anchor_labels(anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh,
+                      neg_iou_thresh, pos_ratio, num_samples, mark_max_gt_anchors):
+    if gt_boxes.size != 0:
+        iou = compute_iou(anchor_boxes, gt_boxes)
+
+        # get positive & negative anchors
+        anchor_max_iou = np.max(iou, axis=1)
+
+        anchor_positive_index1 = np.argmax(iou, axis=0) if mark_max_gt_anchors \
+            else np.empty(0, dtype=np.int32)
+        anchor_positive_index2 = np.nonzero(anchor_max_iou > pos_iou_thresh)[0]
+        anchor_positive_index = np.unique(
+            np.append(anchor_positive_index1, anchor_positive_index2))
+        anchor_negative_index = np.nonzero(anchor_max_iou < neg_iou_thresh)[0]
+    else:
+        anchor_positive_index = np.zeros((0,), dtype=np.int32)
+        anchor_negative_index = np.arange(anchor_boxes.shape[0], dtype=np.int32)
+
+    positive_choice, negative_choice = choose_anchor_subset(
+        num_samples, pos_ratio, len(anchor_positive_index), len(anchor_negative_index))
+
+    anchor_positive_index = anchor_positive_index[positive_choice]
+    anchor_negative_index = anchor_negative_index[negative_choice]
+
+    if gt_boxes.size != 0:
+        gt_positive_index = np.argmax(iou[anchor_positive_index, :], axis=1)
+
+        # collect all anchor indices and generate labels
+        anchor_positive_class_labels = gt_class_labels[gt_positive_index]
+        anchor_positive_loc_labels = get_loc_labels(
+            anchor_boxes[anchor_positive_index, :], gt_boxes[gt_positive_index, :])
+    else:
+        anchor_positive_class_labels = np.zeros((0,), dtype=np.int32)
+        anchor_positive_loc_labels = np.zeros((0, 4), dtype=np.float32)
+
+    return anchor_positive_index, anchor_negative_index, \
+        anchor_positive_class_labels, anchor_positive_loc_labels
