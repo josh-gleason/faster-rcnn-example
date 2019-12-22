@@ -67,13 +67,15 @@ def get_boxes_from_loc_batch(anchor_boxes, loc, img_width, img_height, loc_mean=
     anchor_width_height = anchor_boxes[None, :, None, 2:] - anchor_boxes[None, :, None, :2]
 
     boxes_center_x_y = loc[:, :, None, :2] * anchor_width_height + anchor_center_x_y
-    boxes_width_height = (np.exp(loc[:, :, None, 2:]) * anchor_width_height)
+    boxes_width_height = (torch.exp(loc[:, :, None, 2:]) * anchor_width_height)
 
-    neg_pos = np.array([-0.5, 0.5], dtype=np.float32).reshape(1, 1, 2, 1)
+    neg_pos = torch.tensor([-0.5, 0.5], dtype=torch.float32).reshape(1, 1, 2, 1).to(device=loc.device)
     boxes = (boxes_center_x_y + neg_pos * boxes_width_height).reshape(batch_size, -1, 4)
 
-    boxes[:, :, ::2] = np.clip(boxes[:, :, ::2], 0, img_width)
-    boxes[:, :, 1::2] = np.clip(boxes[:, :, 1::2], 0, img_height)
+    boxes[:, :, 0] = torch.clamp(boxes[:, :, 0], 0, img_width)
+    boxes[:, :, 1] = torch.clamp(boxes[:, :, 1], 0, img_height)
+    boxes[:, :, 2] = torch.clamp(boxes[:, :, 2], 0, img_width)
+    boxes[:, :, 3] = torch.clamp(boxes[:, :, 3], 0, img_height)
 
     return boxes
 

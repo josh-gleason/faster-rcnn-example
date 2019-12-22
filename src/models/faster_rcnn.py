@@ -5,7 +5,7 @@ from torchvision.models import resnet, vgg16
 from torchvision.models.utils import load_state_dict_from_url
 import torchvision.ops as ops
 import numpy as np
-from utils.box_utils import compute_iou, choose_anchor_subset, get_loc_labels
+from utils.box_utils import compute_iou, choose_anchor_subset, get_loc_labels, get_boxes_from_loc_batch
 
 
 class ResNetWrapper(resnet.ResNet):
@@ -183,30 +183,6 @@ class RegionProposalNetwork(nn.Module):
         return pred_loc, pred_obj
 
 
-def get_boxes_from_loc2(anchor_boxes, loc, img_width, img_height, loc_mean=None, loc_std=None):
-    # assumes loc is provided with a batch dimension at dim 0
-    batch_size = loc.shape[0]
-
-    if loc_mean is not None:
-        loc = loc * loc_std.reshape(1, 1, 4) + loc_mean.reshape(1, 1, 4)
-
-    anchor_center_x_y = 0.5 * (anchor_boxes[None, :, None, :2] + anchor_boxes[None, :, None, 2:])
-    anchor_width_height = anchor_boxes[None, :, None, 2:] - anchor_boxes[None, :, None, :2]
-
-    boxes_center_x_y = loc[:, :, None, :2] * anchor_width_height + anchor_center_x_y
-    boxes_width_height = (torch.exp(loc[:, :, None, 2:]) * anchor_width_height)
-
-    neg_pos = torch.tensor([-0.5, 0.5], dtype=torch.float32).reshape(1, 1, 2, 1).to(device=loc.device)
-    boxes = (boxes_center_x_y + neg_pos * boxes_width_height).reshape(batch_size, -1, 4)
-
-    boxes[:, :, 0] = torch.clamp(boxes[:, :, 0], 0, img_width)
-    boxes[:, :, 1] = torch.clamp(boxes[:, :, 1], 0, img_height)
-    boxes[:, :, 2] = torch.clamp(boxes[:, :, 2], 0, img_width)
-    boxes[:, :, 3] = torch.clamp(boxes[:, :, 3], 0, img_height)
-
-    return boxes
-
-
 class PreprocessHead(nn.Module):
     def __init__(self, anchor_boxes):
         super().__init__()
@@ -230,7 +206,7 @@ class PreprocessHead(nn.Module):
 
         pred_obj_sm = torch.softmax(pred_obj, dim=2)[:, :, 1]
 
-        pred_boxes = get_boxes_from_loc2(anchor_boxes, pred_loc, self.img_width, self.img_height)
+        pred_boxes = get_boxes_from_loc_batch(anchor_boxes, pred_loc, self.img_width, self.img_height)
 
         pred_boxes_post_nms = []
         for batch_idx in range(batch_size):
@@ -395,22 +371,16 @@ class TrainingProposalSelector:
 
 
 class FasterRCNN(nn.Module):
-    def __init__(self, anchor_boxes, num_anchors=9, num_classes=92, return_rpn_output=False):
+    def __init__(self, anchor_boxes, num_anchors=9, num_classes=92, return_rpn_output=False, arch='vgg16'):
         super().__init__()
         self.return_rpn_output = return_rpn_output
 
-        # TODO get resnet architecture working
-        # arch = 'resnet18'
-        # self.feature_net = FeatureNetResNet(arch)
-        self.feature_net = FeatureNetVGG16()
-
-        self.region_proposal_network = RegionProposalNetwork(
-            num_anchors, self.feature_net.get_out_channels())
+        self.feature_net = FeatureNetVGG16() if arch == 'vgg16' else FeatureNetResNet(arch)
+        self.region_proposal_network = RegionProposalNetwork(num_anchors,
+                                                             self.feature_net.get_out_channels())
         self.preprocess_head = PreprocessHead(anchor_boxes)
+        self.head = HeadVGG16(num_classes) if arch == 'vgg16' else HeadResNet(num_classes, arch)
         self.training_proposal_selector = TrainingProposalSelector()
-
-        # self.head = HeadResNet(num_classes, arch)
-        self.head = HeadVGG16(num_classes)
 
     def forward(self, x, initial_batch_idx, gt_boxes=None, gt_class_labels=None, gt_count=None):
         if self.training:

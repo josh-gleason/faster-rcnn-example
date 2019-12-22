@@ -30,6 +30,9 @@ from models.criterion import FasterRCNNCriterion
 parser = argparse.ArgumentParser('Training code for simple Faster-RCNN implementation')
 parser.add_argument('dataset', default='voc', type=str, choices={'voc', 'coco'},
                     help='Which dataset to train on')
+parser.add_argument('--arch', default='vgg16', type=str,
+                    choices={'vgg16', 'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152'},
+                    help='faster-rcnn backbone architecture (default vgg16)')
 parser.add_argument('--coco-root', '-cr', default='../coco', type=str,
                     help='Root directory of COCO dataset')
 parser.add_argument('--voc-root', '-vr', default='../pascal_voc', type=str,
@@ -128,7 +131,6 @@ def load_datasets(sub_sample, resize_shape):
     else:
         raise ValueError
 
-    # train_sampler = torch.utils.data.RandomSampler(train_dataset, replacement=True, num_samples=1000)
     train_sampler = torch.utils.data.RandomSampler(train_dataset)  # equivalent to shuffle=True
 
     train_loader = torch.utils.data.DataLoader(
@@ -182,10 +184,12 @@ def save_checkpoint(model, criterion, optimizer, lr_scheduler, epoch, best_map, 
         'lr_scheduler.state_dict': lr_scheduler.state_dict(),
         'epoch': epoch + 1,
         'best_map': best_map}
+    os.makedirs(os.path.dirname(checkpoint_name), exist_ok=True)
     torch.save(checkpoint, checkpoint_name)
     print('Finished saving checkpoint', checkpoint_name)
     if is_best:
         best_checkpoint_name = args.best_checkpoint_format.format(epoch=epoch, best_map=best_map)
+        os.makedirs(os.path.dirname(best_checkpoint_name), exist_ok=True)
         print('Copying', checkpoint_name, 'to', best_checkpoint_name)
         shutil.copyfile(checkpoint_name, best_checkpoint_name)
         print('Finished copying to', best_checkpoint_name)
@@ -296,8 +300,8 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
                                                                   orig_shapes)
                 gt_img = draw_detections(img, rect_list_gt, text_list_gt)
 
-                writer.add_image('Train {}/net'.format(epoch), tvtf.to_tensor(pred_img))
-                writer.add_image('Train {}/gt'.format(epoch), tvtf.to_tensor(gt_img))
+                writer.add_images('Train {}/example_gt_pred'.format(epoch),
+                                  torch.stack((tvtf.to_tensor(gt_img), tvtf.to_tensor(pred_img)), dim=0))
 
                 writer.add_scalar('Loss {}/train loss'.format(epoch), loss_avg.average, batch_num)
                 writer.add_scalar('Loss {}/train rpn_obj_loss'.format(epoch), rpn_obj_loss_avg.average, batch_num)
@@ -364,7 +368,7 @@ def validate(writer, model, val_loader, save_pred_filename='', save_gt_filename=
         coco_gt_file = os.path.join(args.coco_root, 'annotations/instances_val2017.json')
         validate_map = compute_map_coco(coco_gt_file, preds, image_ids)
     else:
-        validate_map = compute_map(preds, gt)
+        validate_map = compute_map(gt, preds)
     print('mAP score @ 0.5 IoU: {:.5}'.format(validate_map))
     return validate_map
 
@@ -392,12 +396,13 @@ def eval_examples(writer, model, val_loader, num_shown_examples=10):
 
                     rect_list_pred, text_list_pred = get_display_pred_boxes(output, resized_shapes, orig_shapes, batch_idx)
                     pred_img = draw_detections(img, rect_list_pred, text_list_pred)
-                    writer.add_image('Validate/net {}'.format(shown_examples), tvtf.to_tensor(pred_img))
 
                     rect_list_gt, text_list_gt = get_display_gt_boxes(gt_boxes, gt_class_labels, gt_count, resized_shapes,
                                                                       orig_shapes, batch_idx)
                     gt_img = draw_detections(img, rect_list_gt, text_list_gt)
-                    writer.add_image('Validate/gt {}'.format(shown_examples), tvtf.to_tensor(gt_img))
+
+                    writer.add_images('Validate/example_{}_gt_pred'.format(shown_examples),
+                                      torch.stack((tvtf.to_tensor(gt_img), tvtf.to_tensor(pred_img)), dim=0))
 
                     shown_examples += 1
 
@@ -413,7 +418,7 @@ def main(writer):
     train_loader, val_loader, anchor_boxes, num_classes = load_datasets(sub_sample, (resize_height, resize_width))
 
     # define model
-    model = FasterRCNN(anchor_boxes, num_classes=num_classes, return_rpn_output=True)
+    model = FasterRCNN(anchor_boxes, num_classes=num_classes, return_rpn_output=True, arch=args.arch)
     model = torch.nn.DataParallel(model).cuda()
 
     # define optimizer
@@ -445,16 +450,19 @@ def main(writer):
         lr_scheduler.step()
 
         eval_examples(writer, model, val_loader)
-        if args.quick_validate:
-            validate_map = validate(writer, model, val_loader)
+        if not args.quick_validate:
+            validate_map = validate(writer, model, val_loader,
+                                    save_pred_filename=f'val_preds_{epoch}.npy',
+                                    save_gt_filename=f'val_gt_{epoch}.npy',
+                                    save_coco_filename=f'val_preds_{epoch}.json')
+        else:
+            validate_map = 0.0
 
         is_best = validate_map > best_map
         if is_best:
             print("This is the best mAP score so far!")
             best_map = validate_map
 
-        best_map = 0
-        is_best = False
         save_checkpoint(model, criterion, optimizer, lr_scheduler, epoch, best_map, is_best)
 
 
