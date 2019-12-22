@@ -90,6 +90,12 @@ def get_boxes_from_loc(anchor_boxes, loc, img_width, img_height, loc_mean=None, 
     if orig_height is None:
         orig_height = img_height
 
+    # define scale to convert boxes back to original image coords
+    if float(img_width) / orig_width < float(img_height) / orig_height:
+        scale = float(img_width) / orig_width
+    else:
+        scale = float(img_height) / orig_height
+
     anchor_center_x_y = 0.5 * (anchor_boxes[:, None, :2] + anchor_boxes[:, None, 2:])
     anchor_width_height = anchor_boxes[:, None, 2:] - anchor_boxes[:, None, :2]
 
@@ -97,20 +103,20 @@ def get_boxes_from_loc(anchor_boxes, loc, img_width, img_height, loc_mean=None, 
     boxes_width_height = (np.exp(loc[:, None, 2:]) * anchor_width_height)
 
     neg_pos = np.array([-0.5, 0.5], dtype=np.float32).reshape(1, 2, 1)
-    boxes = (boxes_center_x_y + neg_pos * boxes_width_height).reshape(-1, 4)
+    boxes = (boxes_center_x_y + neg_pos * boxes_width_height).reshape(-1, 4) / scale
 
-    boxes[:, ::2] = np.clip(boxes[:, ::2], 0, img_width) * (orig_width / img_width)
-    boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, img_height) * (orig_height / img_height)
+    boxes[:, ::2] = np.clip(boxes[:, ::2], 0, orig_width)
+    boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, orig_height)
 
     return boxes
 
 
-def define_anchor_boxes(sub_sample, width, height):
+def define_anchor_boxes(sub_sample, width, height, ratios=(0.5, 1.0, 2.0), scales=(8, 16, 32)):
     feature_map_w, feature_map_h = (width // sub_sample), (height // sub_sample)
 
     # using np.array
-    ratios = np.array((0.5, 1, 2), dtype=np.float32).reshape(-1, 1)
-    anchor_scales = np.array((8, 16, 32), dtype=np.float32).reshape(1, -1)
+    ratios = np.array(ratios, dtype=np.float32).reshape(-1, 1)
+    anchor_scales = np.array(scales, dtype=np.float32).reshape(1, -1)
     anchor_base_x = (sub_sample * anchor_scales * np.sqrt(ratios) / 2).reshape(1, -1, 1, 1)
     anchor_base_y = (sub_sample * anchor_scales * np.sqrt(1.0 / ratios) / 2).reshape(1, -1, 1, 1)
     ctr_x, ctr_y = np.meshgrid(
@@ -122,32 +128,8 @@ def define_anchor_boxes(sub_sample, width, height):
     anchors_x = ctr_x + (anchor_base_x * neg_pos)
     anchors_y = ctr_y + (anchor_base_y * neg_pos)
     anchor_boxes = np.stack((anchors_x, anchors_y), axis=3).reshape(-1, 4)
-    valid_anchors = np.nonzero(
-        np.concatenate((anchor_boxes[:, :2] >= 0,
-                        anchor_boxes[:, 2:3] < width,
-                        anchor_boxes[:, 3:4] < height),
-                       axis=1).all(axis=1))[0]
 
-    ratios = np.array((0.5, 1, 2), dtype=np.float32).reshape(-1, 1)
-    anchor_scales = np.array((8, 16, 32), dtype=np.float32).reshape(1, -1)
-    anchor_base_x = (sub_sample * anchor_scales * np.sqrt(ratios) / 2).reshape(1, -1, 1, 1)
-    anchor_base_y = (sub_sample * anchor_scales * np.sqrt(1.0 / ratios) / 2).reshape(1, -1, 1, 1)
-    ctr_x, ctr_y = np.meshgrid(
-        sub_sample // 2 + sub_sample * np.arange(feature_map_w, dtype=np.float32),
-        sub_sample // 2 + sub_sample * np.arange(feature_map_h, dtype=np.float32))
-    ctr_x = ctr_x.reshape(-1, 1, 1, 1)
-    ctr_y = ctr_y.reshape(-1, 1, 1, 1)
-    neg_pos = np.array([-1.0, 1.0], dtype=np.float32).reshape(1, 1, -1, 1)
-    anchors_x = ctr_x + (anchor_base_x * neg_pos)
-    anchors_y = ctr_y + (anchor_base_y * neg_pos)
-    anchor_boxes = np.concatenate((anchors_x, anchors_y), axis=3).reshape(-1, 4)
-    valid_anchors = np.nonzero(
-        np.concatenate((anchor_boxes[:, :2] >= 0,
-                        anchor_boxes[:, 2:3] < width,
-                        anchor_boxes[:, 3:4] < height),
-                       axis=1).all(axis=1))[0]
-
-    return anchor_boxes, valid_anchors
+    return anchor_boxes
 
 
 def apply_nms(boxes, scores, threshold, n_results=-1, return_scores=False):

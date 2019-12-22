@@ -1,5 +1,27 @@
 import numpy as np
 import torch
+from torchvision import transforms as tvt
+import torchvision.transforms.functional as tvtf
+
+
+class ResizeAndPad(tvt.Resize):
+    def __call__(self, img):
+        img_width, img_height = img.size
+        new_width, new_height = self.size
+
+        # pad to desired aspect ratio first then resize
+        # if desired_aspect == 1 then pixels are scaled perfectly
+        desired_aspect = float(new_width) / new_height
+        if float(new_width) / img_width < float(new_height) / img_height:
+            pad_width = 0
+            scale_height = img_width / (img_height * desired_aspect)
+            pad_height = max(0, int(round(img_height * scale_height - img_height)))
+        else:
+            pad_height = 0
+            scale_width = desired_aspect * img_height / img_width
+            pad_width = max(0, int(round(img_width * scale_width - img_width)))
+
+        return tvtf.resize(tvtf.pad(img, (0, 0, pad_width, pad_height)), self.size)
 
 
 def faster_rcnn_collate_fn(batch):

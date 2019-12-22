@@ -16,7 +16,7 @@ import torchvision.transforms.functional as tvtf
 
 from data.coco import CocoDetectionWithImgId, create_coco_targets
 from data.voc import create_voc_targets
-from data.general import faster_rcnn_collate_fn
+from data.general import faster_rcnn_collate_fn, ResizeAndPad
 
 from utils.data_mappings import coco_num_obj_classes, coco_id_to_name, voc_num_obj_classes, voc_id_to_name
 from utils.box_utils import define_anchor_boxes, get_bboxes_from_output
@@ -75,26 +75,24 @@ args = parser.parse_args()
 
 
 def load_datasets(sub_sample, resize_shape):
-    # TODO Pad images with zeros and find appropriate valid anchors to allow for inputs
-    #      of difference sizes and aspect ratios
-    anchor_boxes, valid_anchors = define_anchor_boxes(sub_sample=sub_sample, height=resize_shape[0], width=resize_shape[1])
+    anchor_boxes = define_anchor_boxes(sub_sample=sub_sample, height=resize_shape[0], width=resize_shape[1])
 
     # TODO Improve the transforms with better data augmentation
     train_transform = tvt.Compose([
-        tvt.Resize(resize_shape),
+        tvt.ColorJitter(0.1, 0.1, 0.1, 0.1),
+        ResizeAndPad(resize_shape),
         tvt.ToTensor(),
         tvt.Normalize([0.5] * 3, [0.5] * 3)
     ])
     val_transform = tvt.Compose([
-        tvt.Resize(resize_shape),
+        ResizeAndPad(resize_shape),
         tvt.ToTensor(),
         tvt.Normalize([0.5] * 3, [0.5] * 3)
     ])
 
     if args.dataset == 'coco':
         print('Loading MSCOCO Detection dataset')
-        base_transforms = partial(create_coco_targets, resize_shape=resize_shape, anchor_boxes=anchor_boxes,
-                                  valid_anchors=valid_anchors)
+        base_transforms = partial(create_coco_targets, resize_shape=resize_shape, anchor_boxes=anchor_boxes)
 
         train_transforms = partial(base_transforms, data_transform=train_transform)
         val_transforms = partial(base_transforms, data_transform=val_transform)
@@ -114,8 +112,7 @@ def load_datasets(sub_sample, resize_shape):
         num_classes = coco_num_obj_classes
     elif args.dataset == 'voc':
         print('Loading Pascal VOC 2012 Detection dataset')
-        base_transforms = partial(create_voc_targets, resize_shape=resize_shape, anchor_boxes=anchor_boxes,
-                                  valid_anchors=valid_anchors)
+        base_transforms = partial(create_voc_targets, resize_shape=resize_shape, anchor_boxes=anchor_boxes)
 
         train_transforms = partial(base_transforms, data_transform=train_transform)
         val_transforms = partial(base_transforms, data_transform=val_transform)
@@ -231,11 +228,12 @@ def get_display_pred_boxes(output, resized_shapes, orig_shapes, batch_idx=0, top
 
 
 def get_display_gt_boxes(gt_boxes, gt_class_labels, gt_count, resized_shapes, orig_shapes, batch_idx=0):
-    scale_x = orig_shapes[batch_idx][0] / resized_shapes[batch_idx][0]
-    scale_y = orig_shapes[batch_idx][1] / resized_shapes[batch_idx][1]
+    scale_x = resized_shapes[batch_idx][0] / orig_shapes[batch_idx][0]
+    scale_y = resized_shapes[batch_idx][1] / orig_shapes[batch_idx][1]
+    scale = min(scale_x, scale_y)
+
     rect_list_gt = gt_boxes[batch_idx][:gt_count[batch_idx]].cpu().numpy()
-    rect_list_gt[:, ::2] *= scale_x
-    rect_list_gt[:, 1::2] *= scale_y
+    rect_list_gt /= scale
     text_list_gt = [coco_id_to_name[lid.item()] if args.dataset == 'coco'
                     else voc_id_to_name[lid.item()]
                     for lid in gt_class_labels[batch_idx][:gt_count[batch_idx]]]
