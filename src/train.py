@@ -457,6 +457,8 @@ def main(writer):
         else:
             validate_map = 0.0
 
+        writer.add_scalar('Validate/mAP', validate_map, epoch)
+
         is_best = validate_map > best_map
         if is_best:
             print("This is the best mAP score so far!")
