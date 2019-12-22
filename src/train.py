@@ -451,10 +451,7 @@ def main(writer):
 
         eval_examples(writer, model, val_loader)
         if not args.quick_validate:
-            validate_map = validate(writer, model, val_loader,
-                                    save_pred_filename=f'val_preds_{epoch}.npy',
-                                    save_gt_filename=f'val_gt_{epoch}.npy',
-                                    save_coco_filename=f'val_preds_{epoch}.json')
+            validate_map = validate(writer, model, val_loader)
         else:
             validate_map = 0.0
 
