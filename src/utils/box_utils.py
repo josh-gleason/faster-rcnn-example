@@ -75,9 +75,15 @@ def get_boxes_from_loc_batch(anchor_boxes, loc, img_width, img_height, loc_mean=
     return boxes
 
 
-def get_boxes_from_loc(anchor_boxes, loc, img_width, img_height, loc_mean=None, loc_std=None):
+def get_boxes_from_loc(anchor_boxes, loc, img_width, img_height, loc_mean=None, loc_std=None,
+                       orig_width=None, orig_height=None):
     if loc_mean is not None:
         loc = loc * loc_std.reshape(1, 4) + loc_mean.reshape(1, 4)
+
+    if orig_width is None:
+        orig_width = img_width
+    if orig_height is None:
+        orig_height = img_height
 
     anchor_center_x_y = 0.5 * (anchor_boxes[:, None, :2] + anchor_boxes[:, None, 2:])
     anchor_width_height = anchor_boxes[:, None, 2:] - anchor_boxes[:, None, :2]
@@ -88,8 +94,8 @@ def get_boxes_from_loc(anchor_boxes, loc, img_width, img_height, loc_mean=None, 
     neg_pos = np.array([-0.5, 0.5], dtype=np.float32).reshape(1, 2, 1)
     boxes = (boxes_center_x_y + neg_pos * boxes_width_height).reshape(-1, 4)
 
-    boxes[:, ::2] = np.clip(boxes[:, ::2], 0, img_width)
-    boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, img_height)
+    boxes[:, ::2] = np.clip(boxes[:, ::2], 0, img_width) * (orig_width / img_width)
+    boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, img_height) * (orig_height / img_height)
 
     return boxes
 

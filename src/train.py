@@ -1,4 +1,6 @@
 import os
+import json
+import tempfile
 from tqdm import tqdm
 from datetime import datetime
 import shutil
@@ -21,6 +23,8 @@ from utils.data_mappings import coco_num_obj_classes, coco_id_to_name, voc_num_o
 from utils.box_utils import compute_iou, choose_anchor_subset, get_loc_labels, define_anchor_boxes, get_boxes_from_loc
 from utils.image_utils import draw_detections
 from models.faster_rcnn import FasterRCNN
+
+from PIL import Image
 
 parser = argparse.ArgumentParser('Training code for simple Faster-RCNN implementation')
 parser.add_argument('dataset', default='voc', type=str, choices={'voc', 'coco'},
@@ -159,6 +163,22 @@ class AverageMeter:
         self._first = True
 
 
+class CocoDetectionWithImgId(datasets.CocoDetection):
+    def __getitem__(self, index):
+        coco = self.coco
+        img_id = self.ids[index]
+        ann_ids = coco.getAnnIds(imgIds=img_id)
+        target = coco.loadAnns(ann_ids)
+
+        path = coco.loadImgs(img_id)[0]['file_name']
+
+        img = Image.open(os.path.join(self.root, path)).convert('RGB')
+        if self.transforms is not None:
+            img, target = self.transforms(img, target, img_id)
+
+        return img, target
+
+
 def remove_duplicate_anchors(anchor_index, gt_index, iou):
     # sort by ascending anchor index then by descending iou
     sorted_order = np.lexsort((anchor_index, -iou))
@@ -213,14 +233,18 @@ def get_anchor_labels(anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh,
         anchor_positive_class_labels, anchor_positive_loc_labels
 
 
-def create_coco_targets(data, labels, data_transform, resize_shape, anchor_boxes, valid_anchors, pos_iou_thresh=0.7,
+def create_coco_targets(data, labels, image_id, data_transform, resize_shape, anchor_boxes, valid_anchors, pos_iou_thresh=0.7,
                         neg_iou_thresh=0.3, pos_ratio=0.5, num_samples=256, mark_max_gt_anchors=True):
     orig_width, orig_height = data.size
     new_width, new_height = resize_shape
 
+    orig_img = data
+
     num_anchors = anchor_boxes.shape[0]
 
     if len(labels) > 0:
+        ignore = np.array([('ignore' in label and label['ignore']) or ('iscrowd' in label and label['iscrowd']) for label in labels], dtype=np.bool)
+
         gt_class_labels = np.array([label['category_id'] for label in labels], dtype=np.int32)
         gt_boxes = np.array([label['bbox'] for label in labels], dtype=np.float32)
 
@@ -231,6 +255,7 @@ def create_coco_targets(data, labels, data_transform, resize_shape, anchor_boxes
         gt_boxes[:, ::2] *= scale_x
         gt_boxes[:, 1::2] *= scale_y
     else:
+        ignore = np.zeros((0,), dtype=np.bool)
         gt_class_labels = np.zeros((0,), dtype=np.int32)
         gt_boxes = np.zeros((0, 4), dtype=np.float32)
 
@@ -252,13 +277,16 @@ def create_coco_targets(data, labels, data_transform, resize_shape, anchor_boxes
     anchor_obj_final[negative_index] = 0
 
     # gt_boxes and gt_class_labels need to be ignored during collate
-    return data_transform(data), (anchor_obj_final, anchor_loc_final, gt_boxes, gt_class_labels)
+    return data_transform(data), (anchor_obj_final, anchor_loc_final, gt_boxes, gt_class_labels,
+                                  image_id, ignore, orig_img)
 
 
 def create_voc_targets(data, labels, data_transform, resize_shape, anchor_boxes, valid_anchors, pos_iou_thresh=0.7,
                        neg_iou_thresh=0.3, pos_ratio=0.5, num_samples=256, mark_max_gt_anchors=True):
     orig_width, orig_height = data.size
     new_width, new_height = resize_shape
+
+    orig_img = data
 
     num_anchors = anchor_boxes.shape[0]
 
@@ -278,6 +306,10 @@ def create_voc_targets(data, labels, data_transform, resize_shape, anchor_boxes,
         gt_class_labels = np.zeros((0,), dtype=np.int32)
         gt_boxes = np.zeros((0, 4), dtype=np.float32)
 
+    # image_ids and ignore are not used in pascal voc
+    gt_image_id = 0
+    ignore = np.zeros(gt_class_labels.shape, dtype=np.bool)
+
     valid_anchor_boxes = anchor_boxes[valid_anchors, :]
 
     valid_positive_index, valid_negative_index, positive_class, positive_loc = \
@@ -296,7 +328,8 @@ def create_voc_targets(data, labels, data_transform, resize_shape, anchor_boxes,
     anchor_obj_final[negative_index] = 0
 
     # gt_boxes and gt_class_labels need to be ignored during collate
-    return data_transform(data), (anchor_obj_final, anchor_loc_final, gt_boxes, gt_class_labels)
+    return data_transform(data), (anchor_obj_final, anchor_loc_final, gt_boxes, gt_class_labels,
+                                  gt_image_id, ignore, orig_img)
 
 
 def pad_zero_rows(ary, total_rows):
@@ -312,9 +345,14 @@ def faster_rcnn_collate_fn(batch):
     gt_boxes = [pad_zero_rows(b[1][2], gt_max_count) for b in batch]
     gt_class_labels = [pad_zero_rows(b[1][3], gt_max_count) for b in batch]
 
-    batch = [(b[0], (b[1][0], b[1][1], boxes, labels, counts, batch_idx))
+    imgs = [b[1][-1] for b in batch]
+    gt_ignore_labels = [b[1][-2] for b in batch]
+    batch = [(b[0], (b[1][0], b[1][1], boxes, labels, counts, batch_idx, b[1][-3]))
              for batch_idx, (b, boxes, labels, counts) in enumerate(zip(batch, gt_boxes, gt_class_labels, gt_count))]
-    return torch.utils.data.dataloader.default_collate(batch)
+    data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels, gt_count, data_batch_idx, gt_image_ids) = \
+        torch.utils.data.dataloader.default_collate(batch)
+    return data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels, gt_count, data_batch_idx,
+                  gt_image_ids, gt_ignore_labels, imgs)
 
 
 def load_datasets(sub_sample, resize_shape):
@@ -342,13 +380,13 @@ def load_datasets(sub_sample, resize_shape):
         train_transforms = partial(base_transforms, data_transform=train_transform)
         val_transforms = partial(base_transforms, data_transform=val_transform)
 
-        train_dataset = datasets.CocoDetection(
+        train_dataset = CocoDetectionWithImgId(
             os.path.join(args.coco_root, 'images/train2017'),
             os.path.join(args.coco_root, 'annotations/instances_train2017.json'),
             transforms=train_transforms,
         )
 
-        val_dataset = datasets.CocoDetection(
+        val_dataset = CocoDetectionWithImgId(
             os.path.join(args.coco_root, 'images/val2017'),
             os.path.join(args.coco_root, 'annotations/instances_val2017.json'),
             transforms=val_transforms,
@@ -392,7 +430,7 @@ def load_datasets(sub_sample, resize_shape):
         batch_size=args.test_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        drop_last=True,
+        drop_last=False,
         collate_fn=faster_rcnn_collate_fn,
         pin_memory=True
     )
@@ -549,7 +587,7 @@ class FasterRCNNCriterion(nn.Module):
         return torch.sum(loss) / float(batch_size)
 
 
-def get_display_boxes(output, batch_idx=0, top3=False):
+def get_display_boxes(output, orig_shapes, resized_shapes, batch_idx=0, top3=False):
     pred_roi_cls = torch.softmax(output['pred_roi_cls'], dim=1).detach().cpu().numpy()
     pred_roi_batch_idx = output['pred_roi_batch_idx'].detach().cpu().numpy()
     pred_roi_boxes = output['pred_roi_boxes'].detach().cpu().numpy()
@@ -563,6 +601,9 @@ def get_display_boxes(output, batch_idx=0, top3=False):
     pred_conf = np.max(pred_roi_cls, axis=1)
     keep_idx = np.nonzero(pred_cls > 0)[0]
 
+    resized_width, resized_height = resized_shapes[batch_idx]
+    orig_width, orig_height = orig_shapes[batch_idx]
+
     text_list = []
     rect_list = []
     if len(keep_idx) > 0:
@@ -571,18 +612,21 @@ def get_display_boxes(output, batch_idx=0, top3=False):
         pred_boxes = pred_roi_boxes[keep_idx]
         pred_loc = pred_roi_loc[keep_idx, pred_cls, :]
 
-        rects = get_boxes_from_loc(pred_boxes, pred_loc, img_width=800, img_height=800, loc_mean=np.array((0., 0., 0., 0.)), loc_std=np.array((0.1, 0.1, 0.2, 0.2)))
-        post_nms = defaultdict(list)
+        rects = get_boxes_from_loc(pred_boxes, pred_loc, img_width=resized_width, img_height=resized_height,
+                                   loc_mean=np.array((0., 0., 0., 0.)),
+                                   loc_std=np.array((0.1, 0.1, 0.2, 0.2)),
+                                   orig_width=orig_width, orig_height=orig_height)
+        pre_nms = defaultdict(list)
         for rect, conf, cls in zip(rects, pred_conf, pred_cls):
             if cls > 0:
-                post_nms[cls].append((rect, conf))
+                pre_nms[cls].append((rect, conf))
 
         post_nms_rects = []
         post_nms_confs = []
         post_nms_labels = []
         rect_list = []
-        for cls in post_nms:
-            cls_rects, cls_conf = zip(*post_nms[cls])
+        for cls in pre_nms:
+            cls_rects, cls_conf = zip(*pre_nms[cls])
             cls_rects = np.concatenate([c.reshape(1, -1) for c in cls_rects], axis=0)
             cls_conf = np.array(cls_conf)
 
@@ -596,7 +640,7 @@ def get_display_boxes(output, batch_idx=0, top3=False):
         post_nms_confs = np.concatenate(post_nms_confs, axis=0)
         post_nms_labels = np.concatenate(post_nms_labels, axis=0)
 
-        keep_idx = np.nonzero(post_nms_confs > 0.7)[0]
+        keep_idx = np.nonzero(post_nms_confs >= 0.7)[0]
 
         if len(keep_idx) == 0 and top3:
             keep_idx = np.argsort(post_nms_confs)[:-4:-1]
@@ -609,11 +653,152 @@ def get_display_boxes(output, batch_idx=0, top3=False):
             rect_list = np.round(post_nms_rects).astype(np.int32).tolist()
 
             for cls_id, conf in zip(post_nms_labels, post_nms_confs):
-                text_list.append('{}({:.4f}'.format(
+                text_list.append('{}({:.4f})'.format(
                     coco_id_to_name[cls_id] if args.dataset == 'coco' else voc_id_to_name[cls_id],
                     conf))
 
     return rect_list, text_list
+
+
+def get_bboxes(output, resized_shapes, orig_shapes, threshold=0.0):
+    all_pred_roi_cls = torch.softmax(output['pred_roi_cls'], dim=1).detach().cpu().numpy()
+    all_pred_roi_batch_idx = output['pred_roi_batch_idx'].detach().cpu().numpy()
+    all_pred_roi_boxes = output['pred_roi_boxes'].detach().cpu().numpy()
+    all_pred_roi_loc = output['pred_roi_loc'].detach().cpu().numpy()
+
+    final_preds = []
+    batch_indices = np.sort(np.unique(all_pred_roi_batch_idx))
+    for batch_idx in batch_indices:
+        resized_shape = resized_shapes[batch_idx]
+        orig_shape = orig_shapes[batch_idx]
+
+        pred_roi_cls = all_pred_roi_cls[all_pred_roi_batch_idx == batch_idx]
+        pred_roi_boxes = all_pred_roi_boxes[all_pred_roi_batch_idx == batch_idx, :]
+        pred_roi_loc = all_pred_roi_loc[all_pred_roi_batch_idx == batch_idx, :]
+
+        pred_cls = np.argmax(pred_roi_cls, axis=1)
+        pred_conf = np.max(pred_roi_cls, axis=1)
+        keep_idx = np.nonzero(pred_cls > 0)[0]
+
+        final_preds.append(defaultdict(lambda: {'rects': [], 'confs': []}))
+        if len(keep_idx) > 0:
+            pred_cls = pred_cls[keep_idx]
+            pred_conf = pred_conf[keep_idx]
+            pred_boxes = pred_roi_boxes[keep_idx]
+            pred_loc = pred_roi_loc[keep_idx, pred_cls, :]
+
+            rects = get_boxes_from_loc(pred_boxes, pred_loc,
+                                       img_width=resized_shape[0], img_height=resized_shape[1],
+                                       loc_mean=np.array((0., 0., 0., 0.)),
+                                       loc_std=np.array((0.1, 0.1, 0.2, 0.2)),
+                                       orig_width=orig_shape[0], orig_height=orig_shape[1])
+            pre_nms = defaultdict(list)
+            for rect, conf, cls in zip(rects, pred_conf, pred_cls):
+                if cls > 0:
+                    pre_nms[cls].append((rect, conf))
+
+            for cls in pre_nms:
+                cls_rects, cls_conf = zip(*pre_nms[cls])
+                cls_rects = np.concatenate([c.reshape(1, -1) for c in cls_rects], axis=0)
+                cls_conf = np.array(cls_conf)
+
+                cls_rects = torch.from_numpy(cls_rects).float()
+                cls_conf = torch.from_numpy(cls_conf).float()
+                keep_nms = ops.nms(cls_rects.cuda(), cls_conf.cuda(), 0.3).cpu()
+                keep_nms = keep_nms[np.nonzero(cls_conf[keep_nms].numpy() >= threshold)[0]]
+
+                if len(keep_nms) > 0:
+                    final_preds[-1][cls]['rects'] = cls_rects[keep_nms].numpy()
+                    final_preds[-1][cls]['confs'] = cls_conf[keep_nms].numpy()
+
+    return final_preds, batch_indices
+
+
+def compute_ap(preds, gt, iou_thresh=0.5):
+    confs = defaultdict(list)
+    tp = defaultdict(list)
+    fp = defaultdict(list)
+    total_gt = defaultdict(lambda: 0)
+
+    for p, g in tqdm(zip(preds, gt), total=len(preds), ncols=0, desc=f'Computing Matches @ IoU {iou_thresh:.02f}'):
+        all_cls = np.union1d(np.array(list(g.keys()), dtype=np.int64), np.array(list(p.keys()), dtype=np.int64))
+        for cls in all_cls:
+            if cls not in g:
+                # everything is a false positive in this case
+                confs[cls].extend(p[cls]['confs'].tolist())
+                tp[cls].extend([0] * len(p[cls]['confs']))
+                fp[cls].extend([1] * len(p[cls]['confs']))
+                continue
+
+            gt_rects = g[cls]['rects']
+            gt_ignore = g[cls]['ignore']
+            total_gt[cls] += len(gt_ignore) - sum(gt_ignore.astype(np.int32))
+
+            if cls not in p:
+                # everything is a false negative in this case
+                continue
+
+            # get sorted in descending order
+            sorted_idx = np.argsort(-p[cls]['confs'])
+            preds_rects = p[cls]['rects'][sorted_idx]
+            preds_confs = p[cls]['confs'][sorted_idx]
+
+            iou = compute_iou(preds_rects, gt_rects)
+            matched_gt_indices = set()
+            for pred_idx, pred_ious in enumerate(iou):
+                confs[cls].append(preds_confs[pred_idx])
+                gt_match_indices = np.argsort(-pred_ious)
+                for top_gt_idx in gt_match_indices:
+                    if pred_ious[top_gt_idx] >= iou_thresh and top_gt_idx not in matched_gt_indices:
+                        matched_gt_indices.add(top_gt_idx)
+                        if gt_ignore[top_gt_idx]:
+                            # ignored matches count as neither false or true positive
+                            tp[cls].append(0)
+                            fp[cls].append(0)
+                        else:
+                            # this is a match count as true positive
+                            tp[cls].append(1)
+                            fp[cls].append(0)
+                        break
+                else:
+                    # no match this is a false positive
+                    fp[cls].append(1)
+                    tp[cls].append(0)
+
+    ap = dict()
+    for cls in confs:
+
+        sort_idx = np.argsort(confs[cls])[::-1]
+        cum_tp = np.cumsum([tp[cls][idx] for idx in sort_idx])
+        cum_fp = np.cumsum([fp[cls][idx] for idx in sort_idx])
+
+        cls_precision = cum_tp / (cum_tp + cum_fp + 1e-16)
+        if total_gt[cls] > 0:
+            cls_recall = cum_tp / float(total_gt[cls])
+        else:
+            cls_recall = cum_tp * 0.0
+
+        # max interpolation of precision
+        cls_interp_precision = np.maximum.accumulate(cls_precision[::-1])[::-1]
+
+        ap[cls] = 0.0
+        prev_recall = 0.0
+        prev_recall_step = 0.0
+        prev_prec = cls_interp_precision[0]
+        for prec, recall in zip(cls_interp_precision, cls_recall):
+            if prec < prev_prec:
+                ap[cls] += (prev_recall - prev_recall_step) * prev_prec
+                prev_recall_step = prev_recall
+            prev_prec = prec
+            prev_recall = recall
+        ap[cls] += (recall - prev_recall_step) * prec
+    return ap
+
+
+def compute_map(preds, gt, iou_thresh=0.5):
+    ap = compute_ap(preds, gt, iou_thresh)
+    mean_ap = np.mean(list(ap.values()))
+    return mean_ap
 
 
 def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_loader):
@@ -625,7 +810,8 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
     roi_cls_loss_avg = AverageMeter(0.998)
     roi_loc_loss_avg = AverageMeter(0.998)
     with tqdm(total=len(train_loader), ncols=0, desc='Training Epoch {}'.format(epoch)) as pbar:
-        for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels, gt_count, initial_batch_idx)) in enumerate(train_loader):
+        for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels,
+                               gt_count, initial_batch_idx, gt_image_ids, ignore, imgs)) in enumerate(train_loader):
             data = data.cuda()
             anchor_obj = anchor_obj.cuda()
             anchor_loc = anchor_loc.cuda()
@@ -652,7 +838,7 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
                 optimizer.zero_grad()
 
             if batch_num % args.print_freq == 0:
-                img = tvtf.to_pil_image(torch.clamp(data[0, :, :, :] * 0.5 + 0.5, 0, 1).cpu())
+                img = imgs[0]
 
                 with torch.no_grad():
                     model.eval()
@@ -660,7 +846,9 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
                     output = model(test_img, torch.tensor((0,)).to(device=test_img.device))
                     model.train()
 
-                rect_list, text_list = get_display_boxes(output, top3=True)
+                resized_shapes = {batch_idx: (d.shape[-1], d.shape[-2]) for batch_idx, d in enumerate(data)}
+                orig_shapes = {batch_idx: img.size for batch_idx, img in enumerate(imgs)}
+                rect_list, text_list = get_display_boxes(output, orig_shapes, resized_shapes, top3=True)
                 pred_img = draw_detections(img, rect_list, text_list)
 
                 writer.add_image('Images/train_{}'.format(epoch), tvtf.to_tensor(pred_img))
@@ -674,38 +862,151 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
             pbar.update()
 
 
-def validate(writer, model, val_loader, stop_after_examples=False):
-    # TODO this doesnt actually do validation right now it just shows some example images in tensorboard
-    num_shown_examples = 10
+def save_coco_style(filename, preds, image_ids):
+    results = []
+    for pred, image_id in zip(preds, image_ids):
+        if image_id == 0:
+            print('WARNING got image_id=0. Removing from results')
+            continue
+        for cls in pred:
+            for rect, conf in zip(pred[cls]['rects'], pred[cls]['confs']):
+                x, y, x2, y2 = rect
+                w, h = x2 - x, y2 - y
+                bbox = [round(float(v), 1) for v in [x, y, w, h]]
+                results.append({'image_id': int(image_id.item()),
+                                'category_id': int(cls),
+                                'bbox': bbox,
+                                'score': float(conf)})
 
+    with open(filename, 'w') as fout:
+        json.dump(results, fout)
+
+
+def validate(writer, model, val_loader, save_pred_filename='', save_gt_filename='', save_coco_filename=''):
     model.eval()
     with torch.no_grad():
-        total = min(int(num_shown_examples // args.test_batch_size), len(val_loader)) if stop_after_examples else len(val_loader)
-        with tqdm(total=total, ncols=0, desc='Validation') as pbar:
-            mean_avg_precision = 0.
+        preds = []
+        gt = []
+        image_ids = []
+        for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels,
+                               gt_count, data_batch_idx, gt_image_ids, ignore, imgs)) in \
+                tqdm(enumerate(val_loader), total=len(val_loader), ncols=0, desc='Validation'):
+            data = data.cuda()
+            data_batch_idx = data_batch_idx.cuda()
+            output = model(data, data_batch_idx)
+
+            # get predicted boxes
+            resized_shapes = {batch_idx: (d.shape[-1], d.shape[-2]) for batch_idx, d in enumerate(data)}
+            orig_shapes = {batch_idx: img.size for batch_idx, img in enumerate(imgs)}
+            batch_preds, pred_batch_indices = get_bboxes(output, resized_shapes, orig_shapes)
+
+            batch_image_ids = []
+            batch_gt = []
+            for batch_idx in pred_batch_indices:
+                scale_x = orig_shapes[batch_idx][0] / float(resized_shapes[batch_idx][0])
+                scale_y = orig_shapes[batch_idx][1] / float(resized_shapes[batch_idx][1])
+                batch_gt.append(defaultdict(lambda: {'rects': np.zeros((0, 4), dtype=np.float32),
+                                                     'ignore': np.zeros((0,), dtype=np.bool)}))
+                batch_gt_labels = gt_class_labels[batch_idx][:gt_count[batch_idx]].cpu().numpy().reshape(-1)
+                for label in np.unique(batch_gt_labels):
+                    label_idx = np.nonzero(batch_gt_labels == label)[0]
+                    batch_gt[-1][label]['rects'] = gt_boxes[batch_idx][label_idx].numpy()
+                    batch_gt[-1][label]['rects'][:, ::2] *= scale_x
+                    batch_gt[-1][label]['rects'][:, 1::2] *= scale_y
+                    batch_gt[-1][label]['ignore'] = ignore[batch_idx][label_idx]
+                batch_image_ids.append(gt_image_ids[batch_idx])
+
+            # append to output list
+            preds.extend(batch_preds)
+            gt.extend(batch_gt)
+            image_ids.extend(batch_image_ids)
+
+    preds = [dict(p) for p in preds]
+    gt = [dict(g) for g in gt]
+
+    if save_coco_filename:
+        print(f'Saving {save_coco_filename}')
+        save_coco_style(save_coco_filename, preds, image_ids)
+    if save_pred_filename:
+        print(f'Saving {save_pred_filename}')
+        np.save(save_pred_filename, preds)
+    if save_gt_filename:
+        print(f'Saving {save_gt_filename}')
+        np.save(save_gt_filename, gt)
+
+    if args.dataset == 'coco':
+        coco_gt_file = os.path.join(args.coco_root, 'annotations/instances_val2017.json')
+        validate_map = compute_map_coco(coco_gt_file, preds, image_ids)
+    else:
+        validate_map = compute_map(preds, gt)
+    print('mAP score @ 0.5 IoU: {:.5}'.format(validate_map))
+    return validate_map
+
+
+def eval_examples(writer, model, val_loader, num_shown_examples=10):
+    model.eval()
+    with torch.no_grad():
+        total = min(int(num_shown_examples // args.test_batch_size), len(val_loader))
+        with tqdm(total=total, ncols=0, desc='Val Examples') as pbar:
             shown_examples = 0
-            for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels, gt_count, data_batch_idx)) in enumerate(val_loader):
+            for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels,
+                                   gt_count, data_batch_idx, gt_image_ids, imgs)) in enumerate(val_loader):
                 data = data.cuda()
                 data_batch_idx = data_batch_idx.cuda()
                 output = model(data, data_batch_idx)
                 batch_size = data.shape[0]
+
+                resized_shapes = {batch_idx: (d.shape[-1], d.shape[-2]) for batch_idx, d in enumerate(data)}
+                orig_shapes = {batch_idx: img.size for batch_idx, img in enumerate(imgs)}
                 for batch_idx in range(batch_size):
                     if shown_examples >= num_shown_examples:
-                        if stop_after_examples:
-                            pbar.update()
-                            return 0.
-                        break
-                    img = tvtf.to_pil_image(torch.clamp(data[batch_idx, :, :, :] * 0.5 + 0.5, 0, 1).cpu())
+                        pbar.update()
+                        return
+                    img = imgs[batch_idx]
 
-                    rect_list, text_list = get_display_boxes(output, batch_idx)
+                    rect_list, text_list = get_display_boxes(output, orig_shapes, resized_shapes, batch_idx)
                     pred_img = draw_detections(img, rect_list, text_list)
 
                     writer.add_image('Images/val example {}'.format(shown_examples), tvtf.to_tensor(pred_img))
+
+                    scale_x = orig_shapes[batch_idx][0] / resized_shapes[batch_idx][0]
+                    scale_y = orig_shapes[batch_idx][1] / resized_shapes[batch_idx][1]
+                    rect_list_gt = gt_boxes[batch_idx][:gt_count[batch_idx]].cpu().numpy()
+                    rect_list_gt[:, ::2] *= scale_x
+                    rect_list_gt[:, 1::2] *= scale_y
+                    text_list_gt = [coco_id_to_name[lid.item()] if args.dataset == 'coco'
+                                    else voc_id_to_name[lid.item()]
+                                    for lid in gt_class_labels[batch_idx][:gt_count[batch_idx]]]
+                    gt_img = draw_detections(img, rect_list_gt, text_list_gt)
+                    writer.add_image('Images/val gt {}'.format(shown_examples), tvtf.to_tensor(gt_img))
                     shown_examples += 1
 
                 pbar.update()
 
-    return mean_avg_precision
+
+def compute_map_coco(gt_file, preds, pred_image_ids, iou_thresh=0.5):
+    from pycocotools.cocoeval import COCOeval
+    from pycocotools.coco import COCO
+
+    tdir = tempfile.mkdtemp()
+    try:
+        temp_out = os.path.join(tdir, 'results.json')
+        save_coco_style(temp_out, preds, pred_image_ids)
+
+        cocoGt = COCO(gt_file)
+        cocoDt = cocoGt.loadRes(temp_out)
+        cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
+        cocoEval.params.iouThrs = [iou_thresh]
+        cocoEval.params.maxDets = [100]
+        cocoEval.params.areaRng = ['all']
+        cocoEval.evaluate()
+        cocoEval.accumulate()
+        precision = cocoEval.eval['precision'][0, :, 0, 0, 0]
+        mean_ap = np.mean(precision[precision > -1])
+    finally:
+        shutil.rmtree(tdir, ignore_errors=True)
+
+    return mean_ap
 
 
 def main(writer):
@@ -738,7 +1039,9 @@ def main(writer):
 
     # validate only if indicated
     if args.validate:
-        validate(writer, model, val_loader, stop_after_examples=args.quick_validate)
+        eval_examples(writer, model, val_loader)
+        if not args.quick_validate:
+            validate_map = validate(writer, model, val_loader)
         return
 
     # train
@@ -746,7 +1049,10 @@ def main(writer):
         train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_loader)
         lr_scheduler.step()
 
-        validate_map = validate(writer, model, val_loader, stop_after_examples=args.quick_validate)
+        eval_examples(writer, model, val_loader)
+        if args.quick_validate:
+            validate_map = validate(writer, model, val_loader)
+
         is_best = validate_map > best_map
         if is_best:
             print("This is the best mAP score so far!")
