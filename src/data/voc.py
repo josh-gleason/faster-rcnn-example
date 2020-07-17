@@ -12,7 +12,7 @@ def create_voc_targets(data, labels, data_transform, resize_shape, anchor_boxes,
 
     num_anchors = anchor_boxes.shape[0]
 
-    if float(orig_width) / new_width < float(orig_height) / new_height:
+    if float(new_width) / orig_width < float(new_height) / orig_height:
         scale = float(new_width) / orig_width
     else:
         scale = float(new_height) / orig_height

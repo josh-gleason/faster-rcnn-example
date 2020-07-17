@@ -124,6 +124,13 @@ def load_datasets(sub_sample, resize_shape):
         val_dataset = datasets.VOCDetection(args.voc_root, year='2012', download=download,
                                             image_set='val',
                                             transforms=val_transforms)
+
+        bad_voc_train_indices = {2609}
+        train_dataset = torch.utils.data.Subset(
+            train_dataset, [i for i in range(len(train_dataset)) if i not in bad_voc_train_indices])
+        bad_voc_val_indices = {478}
+        val_dataset = torch.utils.data.Subset(
+            val_dataset, [i for i in range(len(val_dataset)) if i not in bad_voc_val_indices])
         num_classes = voc_num_obj_classes
     else:
         raise ValueError
