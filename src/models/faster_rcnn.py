@@ -184,12 +184,11 @@ class RegionProposalNetwork(nn.Module):
 
 
 class PreprocessHead(nn.Module):
-    def __init__(self, anchor_boxes):
+    def __init__(self, anchor_boxes, img_shape=(1000, 1000)):
         super().__init__()
         self.anchor_boxes = torch.from_numpy(anchor_boxes)
 
-        self.img_width = 800
-        self.img_height = 800
+        self.img_height, self.img_width = img_shape
         self.n_train_pre_nms = 12000
         self.n_train_post_nms = 2000
         self.n_test_pre_nms = 6000
@@ -371,14 +370,15 @@ class TrainingProposalSelector:
 
 
 class FasterRCNN(nn.Module):
-    def __init__(self, anchor_boxes, num_anchors=9, num_classes=92, return_rpn_output=False, arch='vgg16'):
+    def __init__(self, anchor_boxes, num_anchors=9, num_classes=92, return_rpn_output=False, arch='vgg16',
+                 img_shape=(1000, 1000)):
         super().__init__()
         self.return_rpn_output = return_rpn_output
 
         self.feature_net = FeatureNetVGG16() if arch == 'vgg16' else FeatureNetResNet(arch)
         self.region_proposal_network = RegionProposalNetwork(num_anchors,
                                                              self.feature_net.get_out_channels())
-        self.preprocess_head = PreprocessHead(anchor_boxes)
+        self.preprocess_head = PreprocessHead(anchor_boxes, img_shape=img_shape)
         self.head = HeadVGG16(num_classes) if arch == 'vgg16' else HeadResNet(num_classes, arch)
         self.training_proposal_selector = TrainingProposalSelector()
 

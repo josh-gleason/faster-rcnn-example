@@ -8,6 +8,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+import torch.utils.data
 
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets
@@ -16,7 +17,7 @@ import torchvision.transforms.functional as tvtf
 
 from data.coco import CocoDetectionWithImgId, create_coco_targets
 from data.voc import create_voc_targets
-from data.general import faster_rcnn_collate_fn
+from data.general import faster_rcnn_collate_fn, DynamicResize, PadToShape
 
 from utils.data_mappings import coco_num_obj_classes, coco_id_to_name, voc_num_obj_classes, voc_id_to_name
 from utils.box_utils import define_anchor_boxes, get_bboxes_from_output
@@ -25,7 +26,6 @@ from utils.metrics import compute_map, compute_map_coco, save_coco_style, Averag
 
 from models.faster_rcnn import FasterRCNN
 from models.criterion import FasterRCNNCriterion
-
 
 parser = argparse.ArgumentParser('Training code for simple Faster-RCNN implementation')
 parser.add_argument('dataset', default='voc', type=str, choices={'voc', 'coco'},
@@ -39,7 +39,7 @@ parser.add_argument('--voc-root', '-vr', default='../pascal_voc', type=str,
                     help='Root directory of Pascal VOC dataset')
 parser.add_argument('--train-batch-size', '-b', default=1, type=int,
                     help='Training batch size')
-parser.add_argument('--test-batch-size', '-tb', default=16, type=int,
+parser.add_argument('--test-batch-size', '-tb', default=12, type=int,
                     help='Test batch size')
 parser.add_argument('--num-workers', '-j', default=8, type=int,
                     help='Number of workers')
@@ -74,29 +74,77 @@ parser.add_argument('--quick-validate', '-qv', action='store_true',
 args = parser.parse_args()
 
 
-def load_datasets(sub_sample, resize_shape):
-    # TODO Pad images with zeros and find appropriate valid anchors to allow for inputs
-    #      of difference sizes and aspect ratios
-    anchor_boxes, valid_anchors = define_anchor_boxes(sub_sample=sub_sample, height=resize_shape[0], width=resize_shape[1])
+def debug_dataset_view(dataset, anchor_boxes, max_width, max_height):
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(16, 12), dpi=80)
+    ax1, ax2 = fig.subplots(2)
+    for x, (anchor_obj_final, anchor_loc_final, gt_boxes, gt_class_labels,
+            gt_image_id, ignore, resize_shape, orig_img) in dataset:
+        ax1.clear()
+        ax2.clear()
+        # draw original image with labeled gt boxes
+        orig_width, orig_height = orig_img.size
+        rect_list_gt, text_list_gt = get_display_gt_boxes(gt_boxes, gt_class_labels, resize_shape,
+                                                          (orig_height, orig_width))
+        gt_img = draw_detections(orig_img, rect_list_gt, text_list_gt)
+        ax1.imshow(np.array(gt_img))
 
-    # TODO Improve the transforms with better data augmentation
+        # draw actual network input image
+        y = x.numpy().transpose(1, 2, 0)
+        z = y * np.array([0.229, 0.224, 0.225]).reshape((1, 1, 3)) + np.array([0.485, 0.456, 0.406]).reshape((1, 1, 3))
+        z = np.clip(z, 0, 1.0)
+        ax2.imshow(z)
+
+        # draw positive anchor boxes
+        from utils.box_utils import get_boxes_from_loc
+        pos_indices = np.nonzero(anchor_obj_final > 0)[0]
+        pos_boxes = anchor_boxes[pos_indices, :]
+        pos_locs = anchor_loc_final[pos_indices, :]
+        # positive proposals without localization correction are green
+        for box in pos_boxes:
+            x1, y1, x2, y2 = box
+            ax2.plot([x1, x1, x2, x2, x1], [y1, y2, y2, y1, y1], '-g', linewidth=4)
+        # positive proposals with localization correction are yellow
+        pos_boxes_fixed = get_boxes_from_loc(pos_boxes, pos_locs, max_width, max_height)
+        for box in pos_boxes_fixed:
+            x1, y1, x2, y2 = box
+            ax2.plot([x1, x1, x2, x2, x1], [y1, y2, y2, y1, y1], '-y', linewidth=2)
+        # center of negative proposals are red (too noisy to plot as boxes)
+        neg_indices = np.nonzero(anchor_obj_final == 0)[0]
+        for box in anchor_boxes[neg_indices, :]:
+            x1, y1, x2, y2 = box
+            ax2.plot(0.5 * (x1 + x2), 0.5 * (y1 + y2), ' .r')
+
+        fig.show()
+        breakpoint()
+
+
+def load_datasets(sub_sample, min_shape=(600, 600), max_shape=(1000, 1000)):
+    max_height, max_width = max_shape
+    anchor_boxes = define_anchor_boxes(sub_sample=sub_sample, height=max_height, width=max_width)
+
+    # random flipping is done in dataset create_<dataset>_targets
+    mean_val = [0.485, 0.456, 0.406]
+    std_val = [0.229, 0.224, 0.225]
     train_transform = tvt.Compose([
-        tvt.Resize(resize_shape),
+        DynamicResize(min_shape, max_shape),
         tvt.ToTensor(),
-        tvt.Normalize([0.5] * 3, [0.5] * 3)
+        tvt.Normalize(mean_val, std_val),
+        PadToShape(max_shape)
     ])
     val_transform = tvt.Compose([
-        tvt.Resize(resize_shape),
+        DynamicResize(min_shape, max_shape),
         tvt.ToTensor(),
-        tvt.Normalize([0.5] * 3, [0.5] * 3)
+        tvt.Normalize(mean_val, std_val),
+        PadToShape(max_shape)
     ])
 
     if args.dataset == 'coco':
         print('Loading MSCOCO Detection dataset')
-        base_transforms = partial(create_coco_targets, resize_shape=resize_shape, anchor_boxes=anchor_boxes,
-                                  valid_anchors=valid_anchors)
+        base_transforms = partial(create_coco_targets, anchor_boxes=anchor_boxes,
+                                  min_shape=min_shape, max_shape=max_shape)
 
-        train_transforms = partial(base_transforms, data_transform=train_transform)
+        train_transforms = partial(base_transforms, data_transform=train_transform, random_flip=True)
         val_transforms = partial(base_transforms, data_transform=val_transform)
 
         train_dataset = CocoDetectionWithImgId(
@@ -113,25 +161,41 @@ def load_datasets(sub_sample, resize_shape):
 
         num_classes = coco_num_obj_classes
     elif args.dataset == 'voc':
-        print('Loading Pascal VOC 2012 Detection dataset')
-        base_transforms = partial(create_voc_targets, resize_shape=resize_shape, anchor_boxes=anchor_boxes,
-                                  valid_anchors=valid_anchors)
+        print('Loading Pascal VOC 2007 Detection dataset')
+        base_transforms = partial(create_voc_targets, anchor_boxes=anchor_boxes,
+                                  min_shape=min_shape, max_shape=max_shape)
 
-        train_transforms = partial(base_transforms, data_transform=train_transform)
+        train_transforms = partial(base_transforms, data_transform=train_transform, random_flip=True)
         val_transforms = partial(base_transforms, data_transform=val_transform)
 
-        download = not os.path.exists(os.path.join(args.voc_root, 'VOCdevkit/VOC2012'))
-        train_dataset = datasets.VOCDetection(args.voc_root, year='2012', download=download,
-                                              image_set='train',
-                                              transforms=train_transforms)
-        val_dataset = datasets.VOCDetection(args.voc_root, year='2012', download=download,
-                                            image_set='val',
+        download = not os.path.exists(os.path.join(args.voc_root, 'VOCdevkit/VOC2007'))
+        train_dataset = torch.utils.data.ConcatDataset([
+            datasets.VOCDetection(args.voc_root, year='2007', download=download,
+                                  image_set='train',
+                                  transforms=train_transforms),
+            datasets.VOCDetection(args.voc_root, year='2007', download=download,
+                                  image_set='val',
+                                  transforms=train_transforms)])
+        val_dataset = datasets.VOCDetection(args.voc_root, year='2007', download=download,
+                                            image_set='test',
                                             transforms=val_transforms)
         num_classes = voc_num_obj_classes
     else:
         raise ValueError
 
-    train_sampler = torch.utils.data.RandomSampler(train_dataset)  # equivalent to shuffle=True
+    # debug_dataset_view(train_dataset, anchor_boxes, max_width, max_height)
+
+    # n_train = 100
+    # indices = np.arange(len(train_dataset))
+    # np.random.shuffle(indices)
+    # train_dataset = torch.utils.data.Subset(train_dataset, indices[:n_train])
+    #
+    # n_val = 100
+    # indices = np.arange(len(val_dataset))
+    # np.random.shuffle(indices)
+    # val_dataset = torch.utils.data.Subset(val_dataset, indices[:n_val])
+
+    train_sampler = torch.utils.data.RandomSampler(train_dataset)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -184,12 +248,16 @@ def save_checkpoint(model, criterion, optimizer, lr_scheduler, epoch, best_map, 
         'lr_scheduler.state_dict': lr_scheduler.state_dict(),
         'epoch': epoch + 1,
         'best_map': best_map}
-    os.makedirs(os.path.dirname(checkpoint_name), exist_ok=True)
+    out_dir = os.path.dirname(checkpoint_name)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     torch.save(checkpoint, checkpoint_name)
     print('Finished saving checkpoint', checkpoint_name)
     if is_best:
         best_checkpoint_name = args.best_checkpoint_format.format(epoch=epoch, best_map=best_map)
-        os.makedirs(os.path.dirname(best_checkpoint_name), exist_ok=True)
+        out_dir = os.path.dirname(best_checkpoint_name)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         print('Copying', checkpoint_name, 'to', best_checkpoint_name)
         shutil.copyfile(checkpoint_name, best_checkpoint_name)
         print('Finished copying to', best_checkpoint_name)
@@ -230,15 +298,35 @@ def get_display_pred_boxes(output, resized_shapes, orig_shapes, batch_idx=0, top
     return output_rects, output_strs
 
 
-def get_display_gt_boxes(gt_boxes, gt_class_labels, gt_count, resized_shapes, orig_shapes, batch_idx=0):
-    scale_x = orig_shapes[batch_idx][0] / resized_shapes[batch_idx][0]
-    scale_y = orig_shapes[batch_idx][1] / resized_shapes[batch_idx][1]
-    rect_list_gt = gt_boxes[batch_idx][:gt_count[batch_idx]].cpu().numpy()
+def get_display_gt_boxes(gt_boxes, gt_class_labels, resized_shapes, orig_shapes, gt_count=None, batch_idx=None):
+    # if batch_idx is None we assume this is sample directly from dataset so create artificial batch of size 0
+    if batch_idx is None:
+        gt_boxes = [gt_boxes]
+        gt_class_labels = [gt_class_labels]
+        orig_shapes = [orig_shapes]
+        resized_shapes = [resized_shapes]
+        batch_idx = 0
+        gt_count = None if gt_count is None else [gt_count]
+
+    if gt_count is None:
+        gt_count = gt_boxes[batch_idx].shape[0]
+    else:
+        gt_count = gt_count[batch_idx]
+
+    # orig_shapes and resized_shapes provided as (height, width)
+    scale_x = orig_shapes[batch_idx][1] / resized_shapes[batch_idx][1]
+    scale_y = orig_shapes[batch_idx][0] / resized_shapes[batch_idx][0]
+    rect_list_gt = gt_boxes[batch_idx][:gt_count]
+    if torch.is_tensor(rect_list_gt):
+        rect_list_gt = rect_list_gt.cpu().numpy()
+    rect_list_gt = rect_list_gt.copy()
     rect_list_gt[:, ::2] *= scale_x
     rect_list_gt[:, 1::2] *= scale_y
-    text_list_gt = [coco_id_to_name[lid.item()] if args.dataset == 'coco'
-                    else voc_id_to_name[lid.item()]
-                    for lid in gt_class_labels[batch_idx][:gt_count[batch_idx]]]
+    class_labels = gt_class_labels[batch_idx][:gt_count]
+    if torch.is_tensor(class_labels):
+        class_labels = class_labels.cpu().numpy()
+    text_list_gt = [coco_id_to_name[lid] if args.dataset == 'coco'
+                    else voc_id_to_name[lid] for lid in class_labels]
 
     rect_list_gt = rect_list_gt.astype(np.int32).tolist()
 
@@ -255,7 +343,8 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
     roi_loc_loss_avg = AverageMeter(0.998)
     with tqdm(total=len(train_loader), ncols=0, desc='Training Epoch {}'.format(epoch)) as pbar:
         for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels,
-                               gt_count, initial_batch_idx, gt_image_ids, ignore, imgs)) in enumerate(train_loader):
+                               gt_count, initial_batch_idx, gt_image_ids, ignore,
+                               valid_shapes, imgs)) in enumerate(train_loader):
             data = data.cuda()
             anchor_obj = anchor_obj.cuda()
             anchor_loc = anchor_loc.cuda()
@@ -290,24 +379,25 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
                     output = model(test_img, torch.tensor((0,)).to(device=test_img.device))
                     model.train()
 
-                resized_shapes = {batch_idx: (d.shape[-1], d.shape[-2]) for batch_idx, d in enumerate(data)}
-                orig_shapes = {batch_idx: img.size for batch_idx, img in enumerate(imgs)}
+                # resized_shapes = {batch_idx: (d.shape[-1], d.shape[-2]) for batch_idx, d in enumerate(data)}
+                orig_shapes = {batch_idx: (img.size[1], img.size[0]) for batch_idx, img in enumerate(imgs)}
 
-                rect_list, text_list = get_display_pred_boxes(output, resized_shapes, orig_shapes, top3=True)
+                rect_list, text_list = get_display_pred_boxes(output, valid_shapes, orig_shapes, top3=True)
                 pred_img = draw_detections(img, rect_list, text_list)
 
-                rect_list_gt, text_list_gt = get_display_gt_boxes(gt_boxes, gt_class_labels, gt_count, resized_shapes,
-                                                                  orig_shapes)
+                rect_list_gt, text_list_gt = get_display_gt_boxes(gt_boxes, gt_class_labels, valid_shapes,
+                                                                  orig_shapes, gt_count, batch_idx=0)
                 gt_img = draw_detections(img, rect_list_gt, text_list_gt)
 
-                writer.add_images('Train {}/example_gt_pred'.format(epoch),
-                                  torch.stack((tvtf.to_tensor(gt_img), tvtf.to_tensor(pred_img)), dim=0))
+                writer.add_images('Train Epoch {}/example_gt_pred'.format(epoch),
+                                  torch.stack((tvtf.to_tensor(gt_img), tvtf.to_tensor(pred_img)), dim=0),
+                                  global_step=batch_num // args.print_freq)
 
-                writer.add_scalar('Loss {}/train loss'.format(epoch), loss_avg.average, batch_num)
-                writer.add_scalar('Loss {}/train rpn_obj_loss'.format(epoch), rpn_obj_loss_avg.average, batch_num)
-                writer.add_scalar('Loss {}/train rpn_loc_loss'.format(epoch), rpn_loc_loss_avg.average, batch_num)
-                writer.add_scalar('Loss {}/train roi_cls_loss'.format(epoch), roi_cls_loss_avg.average, batch_num)
-                writer.add_scalar('Loss {}/train roi_loc_loss'.format(epoch), roi_loc_loss_avg.average, batch_num)
+                writer.add_scalar('Loss/train loss'.format(epoch), loss_avg.average, batch_num)
+                writer.add_scalar('Loss/train rpn_obj_loss'.format(epoch), rpn_obj_loss_avg.average, batch_num)
+                writer.add_scalar('Loss/train rpn_loc_loss'.format(epoch), rpn_loc_loss_avg.average, batch_num)
+                writer.add_scalar('Loss/train roi_cls_loss'.format(epoch), roi_cls_loss_avg.average, batch_num)
+                writer.add_scalar('Loss/train roi_loc_loss'.format(epoch), roi_loc_loss_avg.average, batch_num)
 
             pbar.update()
 
@@ -319,22 +409,22 @@ def validate(writer, model, val_loader, save_pred_filename='', save_gt_filename=
         gt = []
         image_ids = []
         for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels,
-                               gt_count, data_batch_idx, gt_image_ids, ignore, imgs)) in \
+                               gt_count, data_batch_idx, gt_image_ids, ignore,
+                               valid_shapes, imgs)) in \
                 tqdm(enumerate(val_loader), total=len(val_loader), ncols=0, desc='Validation'):
             data = data.cuda()
             data_batch_idx = data_batch_idx.cuda()
             output = model(data, data_batch_idx)
 
             # get predicted boxes
-            resized_shapes = {batch_idx: (d.shape[-1], d.shape[-2]) for batch_idx, d in enumerate(data)}
-            orig_shapes = {batch_idx: img.size for batch_idx, img in enumerate(imgs)}
-            batch_preds, pred_batch_indices = get_bboxes_from_output(output, resized_shapes, orig_shapes)
+            orig_shapes = {batch_idx: (img.size[1], img.size[0]) for batch_idx, img in enumerate(imgs)}
+            batch_preds, pred_batch_indices = get_bboxes_from_output(output, valid_shapes, orig_shapes)
 
             batch_image_ids = []
             batch_gt = []
             for batch_idx in pred_batch_indices:
-                scale_x = orig_shapes[batch_idx][0] / float(resized_shapes[batch_idx][0])
-                scale_y = orig_shapes[batch_idx][1] / float(resized_shapes[batch_idx][1])
+                scale_x = orig_shapes[batch_idx][1] / float(valid_shapes[batch_idx][1])
+                scale_y = orig_shapes[batch_idx][0] / float(valid_shapes[batch_idx][0])
                 batch_gt.append(defaultdict(lambda: {'rects': np.zeros((0, 4), dtype=np.float32),
                                                      'ignore': np.zeros((0,), dtype=np.bool)}))
                 batch_gt_labels = gt_class_labels[batch_idx][:gt_count[batch_idx]].cpu().numpy().reshape(-1)
@@ -369,40 +459,42 @@ def validate(writer, model, val_loader, save_pred_filename='', save_gt_filename=
         validate_map = compute_map_coco(coco_gt_file, preds, image_ids)
     else:
         validate_map = compute_map(gt, preds)
+
     print('mAP score @ 0.5 IoU: {:.5}'.format(validate_map))
     return validate_map
 
 
-def eval_examples(writer, model, val_loader, num_shown_examples=10):
+def eval_examples(writer, model, val_loader, epoch, num_shown_examples=10):
     model.eval()
     with torch.no_grad():
         total = min(int(num_shown_examples // args.test_batch_size), len(val_loader))
         with tqdm(total=total, ncols=0, desc='Val Examples') as pbar:
             shown_examples = 0
             for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels,
-                                   gt_count, data_batch_idx, gt_image_ids, ignore, imgs)) in enumerate(val_loader):
+                                   gt_count, data_batch_idx, gt_image_ids, ignore,
+                                   valid_shapes, imgs)) in enumerate(val_loader):
                 data = data.cuda()
                 data_batch_idx = data_batch_idx.cuda()
                 output = model(data, data_batch_idx)
                 batch_size = data.shape[0]
 
-                resized_shapes = {batch_idx: (d.shape[-1], d.shape[-2]) for batch_idx, d in enumerate(data)}
-                orig_shapes = {batch_idx: img.size for batch_idx, img in enumerate(imgs)}
+                orig_shapes = {batch_idx: (img.size[1], img.size[0]) for batch_idx, img in enumerate(imgs)}
                 for batch_idx in range(batch_size):
                     if shown_examples >= num_shown_examples:
                         pbar.update()
                         return
                     img = imgs[batch_idx]
 
-                    rect_list_pred, text_list_pred = get_display_pred_boxes(output, resized_shapes, orig_shapes, batch_idx)
+                    rect_list_pred, text_list_pred = get_display_pred_boxes(output, valid_shapes, orig_shapes, batch_idx)
                     pred_img = draw_detections(img, rect_list_pred, text_list_pred)
 
-                    rect_list_gt, text_list_gt = get_display_gt_boxes(gt_boxes, gt_class_labels, gt_count, resized_shapes,
-                                                                      orig_shapes, batch_idx)
+                    rect_list_gt, text_list_gt = get_display_gt_boxes(gt_boxes, gt_class_labels, valid_shapes,
+                                                                      orig_shapes, gt_count, batch_idx)
                     gt_img = draw_detections(img, rect_list_gt, text_list_gt)
 
                     writer.add_images('Validate/example_{}_gt_pred'.format(shown_examples),
-                                      torch.stack((tvtf.to_tensor(gt_img), tvtf.to_tensor(pred_img)), dim=0))
+                                      torch.stack((tvtf.to_tensor(gt_img), tvtf.to_tensor(pred_img)), dim=0),
+                                      global_step=epoch)
 
                     shown_examples += 1
 
@@ -410,15 +502,19 @@ def eval_examples(writer, model, val_loader, num_shown_examples=10):
 
 
 def main(writer):
-    resize_width = 800
-    resize_height = 800
+    min_height = 600
+    min_width = 600
+    max_height = 1000
+    max_width = 1000
     sub_sample = 16
 
     # define datasets
-    train_loader, val_loader, anchor_boxes, num_classes = load_datasets(sub_sample, (resize_height, resize_width))
+    train_loader, val_loader, anchor_boxes, num_classes = load_datasets(
+        sub_sample, (min_height, min_width), (max_height, max_width))
 
     # define model
-    model = FasterRCNN(anchor_boxes, num_classes=num_classes, return_rpn_output=True, arch=args.arch)
+    model = FasterRCNN(anchor_boxes, num_classes=num_classes, return_rpn_output=True, arch=args.arch,
+                       img_shape=(max_height, max_width))
     model = torch.nn.DataParallel(model).cuda()
 
     # define optimizer
@@ -439,7 +535,7 @@ def main(writer):
 
     # validate only if indicated
     if args.validate:
-        eval_examples(writer, model, val_loader)
+        eval_examples(writer, model, val_loader, start_epoch)
         if not args.quick_validate:
             validate_map = validate(writer, model, val_loader)
         return
@@ -449,11 +545,13 @@ def main(writer):
         train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_loader)
         lr_scheduler.step()
 
-        eval_examples(writer, model, val_loader)
+        eval_examples(writer, model, val_loader, epoch)
         if not args.quick_validate:
             validate_map = validate(writer, model, val_loader)
         else:
             validate_map = 0.0
+
+        writer.add_scalar('Validate/mAP', validate_map, epoch)
 
         is_best = validate_map > best_map
         if is_best:

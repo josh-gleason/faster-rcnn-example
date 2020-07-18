@@ -4,3 +4,6 @@ coco
 tensorboard
 src/checkpoints
 pascal_voc
+venv
+__pycache__
+.idea

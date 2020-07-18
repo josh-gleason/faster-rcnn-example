@@ -121,33 +121,9 @@ def define_anchor_boxes(sub_sample, width, height):
     neg_pos = np.array([-1.0, 1.0], dtype=np.float32).reshape(1, 1, -1, 1)
     anchors_x = ctr_x + (anchor_base_x * neg_pos)
     anchors_y = ctr_y + (anchor_base_y * neg_pos)
-    anchor_boxes = np.stack((anchors_x, anchors_y), axis=3).reshape(-1, 4)
-    valid_anchors = np.nonzero(
-        np.concatenate((anchor_boxes[:, :2] >= 0,
-                        anchor_boxes[:, 2:3] < width,
-                        anchor_boxes[:, 3:4] < height),
-                       axis=1).all(axis=1))[0]
-
-    ratios = np.array((0.5, 1, 2), dtype=np.float32).reshape(-1, 1)
-    anchor_scales = np.array((8, 16, 32), dtype=np.float32).reshape(1, -1)
-    anchor_base_x = (sub_sample * anchor_scales * np.sqrt(ratios) / 2).reshape(1, -1, 1, 1)
-    anchor_base_y = (sub_sample * anchor_scales * np.sqrt(1.0 / ratios) / 2).reshape(1, -1, 1, 1)
-    ctr_x, ctr_y = np.meshgrid(
-        sub_sample // 2 + sub_sample * np.arange(feature_map_w, dtype=np.float32),
-        sub_sample // 2 + sub_sample * np.arange(feature_map_h, dtype=np.float32))
-    ctr_x = ctr_x.reshape(-1, 1, 1, 1)
-    ctr_y = ctr_y.reshape(-1, 1, 1, 1)
-    neg_pos = np.array([-1.0, 1.0], dtype=np.float32).reshape(1, 1, -1, 1)
-    anchors_x = ctr_x + (anchor_base_x * neg_pos)
-    anchors_y = ctr_y + (anchor_base_y * neg_pos)
     anchor_boxes = np.concatenate((anchors_x, anchors_y), axis=3).reshape(-1, 4)
-    valid_anchors = np.nonzero(
-        np.concatenate((anchor_boxes[:, :2] >= 0,
-                        anchor_boxes[:, 2:3] < width,
-                        anchor_boxes[:, 3:4] < height),
-                       axis=1).all(axis=1))[0]
 
-    return anchor_boxes, valid_anchors
+    return anchor_boxes
 
 
 def apply_nms(boxes, scores, threshold, n_results=-1, return_scores=False):
@@ -231,10 +207,10 @@ def get_bboxes_from_output(output, resized_shapes, orig_shapes, threshold=0.0):
             pred_loc = pred_roi_loc[keep_idx, pred_cls, :]
 
             rects = get_boxes_from_loc(pred_boxes, pred_loc,
-                                       img_width=resized_shape[0], img_height=resized_shape[1],
+                                       img_width=resized_shape[1], img_height=resized_shape[0],
                                        loc_mean=np.array((0., 0., 0., 0.)),
                                        loc_std=np.array((0.1, 0.1, 0.2, 0.2)),
-                                       orig_width=orig_shape[0], orig_height=orig_shape[1])
+                                       orig_width=orig_shape[1], orig_height=orig_shape[0])
             pre_nms = defaultdict(list)
             for rect, conf, cls in zip(rects, pred_conf, pred_cls):
                 if cls > 0:
