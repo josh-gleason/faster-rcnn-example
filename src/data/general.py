@@ -20,15 +20,12 @@ def compute_scales(orig_shape, min_shape, max_shape):
 
     scale_h = scale_w = min(scale_max, scale_min)
 
-    # TODO THIS IS TEMPORARY!!!
     # make sure both scales result in integer length
     scale_h = round(scale_h * orig_height) / orig_height
     scale_w = round(scale_w * orig_width) / orig_width
 
     return scale_h, scale_w
 
-
-import skimage.transform as sktsf
 
 class DynamicResize:
     _pil_interpolation_to_str = {
@@ -59,12 +56,7 @@ class DynamicResize:
         scale_h, scale_w = compute_scales((img_height, img_width), self.min_shape, self.max_shape)
         scaled_height = int(round(scale_h * img_height))
         scaled_width = int(round(scale_w * img_width))
-        # return tvtf.resize(img, (scaled_height, scaled_width))
-        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
-        img_np = np.array(img, dtype=np.float32).transpose((2, 0, 1)) / 255.0
-        img_out = sktsf.resize(img_np, (3, scaled_height, scaled_width), mode='reflect', anti_aliasing=False).transpose((1, 2, 0))
-        return img_out
-
+        return tvtf.resize(img, (scaled_height, scaled_width), interpolation=self.interpolation)
 
     def __repr__(self):
         interpolate_str = self._pil_interpolation_to_str[self.interpolation]
@@ -88,8 +80,7 @@ class PadToShape:
         return torch.nn.functional.pad(img, [0, pad_height, 0, pad_width], mode=self.mode, value=self.value)
 
     def __repr__(self):
-        return self.__class__.__name__ + '(target_shape={0}, mode={1}, value={2})'.format(
-            self.target_shape, self.mode, self.value)
+        return f'{self.__class__.__name__}(target_shape={self.target_shape}, mode="{self.mode}", value={self.value})'
 
 
 def faster_rcnn_collate_fn(batch):

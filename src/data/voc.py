@@ -23,12 +23,11 @@ def create_voc_targets(data, labels, data_transform, min_shape=(600, 600), max_s
 
     anchor_boxes = define_anchor_boxes(sub_sample, valid_width, valid_height)
 
-    # TODO I think valid_width - 1 and valid_height - 1 is correct but do this to match baseline
     num_anchors = anchor_boxes.shape[0]
     valid_anchors = np.nonzero(
         np.concatenate((anchor_boxes[:, :2] >= 0,
-                        anchor_boxes[:, 2:3] <= valid_width,
-                        anchor_boxes[:, 3:4] <= valid_height),
+                        anchor_boxes[:, 2:3] <= valid_width - 1,
+                        anchor_boxes[:, 3:4] <= valid_height - 1),
                        axis=1).all(axis=1))[0]
 
     obj_labels = labels['annotation']['object']
@@ -41,7 +40,9 @@ def create_voc_targets(data, labels, data_transform, min_shape=(600, 600), max_s
         gt_difficult = np.array([int(label['difficult']) for label in obj_labels if use_difficult or not
                                  int(label['difficult'])], dtype=np.bool)
         gt_boxes = np.array([[int(label['bndbox'][k]) - 1 for k in ['xmin', 'ymin', 'xmax', 'ymax']]
-                             for label in obj_labels if use_difficult or not int(label['difficult'])], dtype=np.float32)
+                              for label in obj_labels if use_difficult or not int(label['difficult'])], dtype=np.float32)
+        gt_boxes[:, :2] -= 0.5
+        gt_boxes[:, 2:] += 0.5
         if flipped:
             gt_boxes[:, ::2] = orig_width - gt_boxes[:, -2::-2]
 

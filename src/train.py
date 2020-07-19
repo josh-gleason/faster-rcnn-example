@@ -20,7 +20,7 @@ from data.voc import create_voc_targets
 from data.general import faster_rcnn_collate_fn, DynamicResize, PadToShape
 
 from utils.data_mappings import coco_num_obj_classes, coco_id_to_name, voc_num_obj_classes, voc_id_to_name
-from utils.box_utils import define_anchor_boxes, get_bboxes_from_output, get_bboxes_from_output2, get_bboxes_from_output3
+from utils.box_utils import define_anchor_boxes, get_boxes_from_output
 from utils.image_utils import draw_detections
 from utils.metrics import compute_map, compute_map_coco, save_coco_style, AverageMeter
 
@@ -165,59 +165,26 @@ def load_datasets(sub_sample, min_shape=(600, 600), max_shape=(1000, 1000)):
 
         train_transforms = partial(base_transforms, data_transform=train_transform, random_flip=True,
                                    use_difficult=False)
-        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
-        # train_transforms = partial(base_transforms, data_transform=train_transform, random_flip=False,
-        #                            use_difficult=False)
         val_transforms = partial(base_transforms, data_transform=val_transform, use_difficult=True)
 
         download = not os.path.exists(os.path.join(args.voc_root, 'VOCdevkit/VOC2007'))
-        d_train = datasets.VOCDetection(args.voc_root, year='2007', download=download,
-                                        image_set='train',
-                                        transforms=train_transforms)
-        d_val = datasets.VOCDetection(args.voc_root, year='2007', download=download,
-                                      image_set='val',
-                                      transforms=train_transforms)
-
-        train_dataset = torch.utils.data.ConcatDataset([d_train, d_val])
-
-        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
-        # images = [(v, idx) for idx, v in enumerate(d_train.images + d_val.images)]
-        # indices = [idx for v, idx in sorted(images, key=lambda x: x[0])]
-        # train_dataset = torch.utils.data.Subset(train_dataset, [indices[0]] * 1000 + indices)
+        train_dataset = torch.utils.data.ConcatDataset([
+            datasets.VOCDetection(args.voc_root, year='2007', download=download,
+                                  image_set='train',
+                                  transforms=train_transforms),
+            datasets.VOCDetection(args.voc_root, year='2007', download=download,
+                                  image_set='val',
+                                  transforms=train_transforms)])
 
         val_dataset = datasets.VOCDetection(args.voc_root, year='2007', download=download,
                                             image_set='test',
                                             transforms=val_transforms)
 
-        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
-        # indices = np.arange(len(val_dataset))
-        # indices[0] = 547
-        # indices[1] = 548
-        # indices[2] = 549
-        # indices[547] = 0
-        # indices[548] = 1
-        # indices[549] = 2
-        # val_dataset = torch.utils.data.Subset(val_dataset, indices)
-
         num_classes = voc_num_obj_classes
     else:
         raise ValueError
 
-    # debug_dataset_view(val_dataset)
-
-    # n_train = 100
-    # indices = np.arange(len(train_dataset))
-    # np.random.shuffle(indices)
-    # train_dataset = torch.utils.data.Subset(train_dataset, indices[:n_train])
-    #
-    # n_val = 100
-    # indices = np.arange(len(val_dataset))
-    # np.random.shuffle(indices)
-    # val_dataset = torch.utils.data.Subset(val_dataset, indices[:n_val])
-
     train_sampler = torch.utils.data.RandomSampler(train_dataset)
-    # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
-    # train_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -296,11 +263,11 @@ def get_optimizer(model, lr=0.01, weight_decay=5e-4, use_adam=True):
     if use_adam:
         return torch.optim.Adam(params)
     else:
-        return torch.optim.SGD(params, momentum=0.9)
+        return torch.optim.SGD(params, lr=lr, momentum=0.9)
 
 
 def get_display_pred_boxes(output, resized_shapes, orig_shapes, batch_idx=0, top3=False):
-    pred_boxes, batch_indices = get_bboxes_from_output(output, resized_shapes, orig_shapes)
+    pred_boxes, batch_indices = get_boxes_from_output(output, resized_shapes, orig_shapes)
     box_index = next(idx for idx, b in enumerate(batch_indices) if b == batch_idx)
     batch_pred_boxes = pred_boxes[box_index]
 
@@ -442,7 +409,7 @@ def validate(writer, model, val_loader, save_pred_filename='', save_gt_filename=
 
             # get predicted boxes
             orig_shapes = {batch_idx: (img.size[1], img.size[0]) for batch_idx, img in enumerate(imgs)}
-            batch_preds, pred_batch_indices = get_bboxes_from_output3(output, valid_shapes, orig_shapes)
+            batch_preds, pred_batch_indices = get_boxes_from_output(output, valid_shapes, orig_shapes)
 
             batch_image_ids = []
             batch_gt = []

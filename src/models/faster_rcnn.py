@@ -117,11 +117,9 @@ class HeadResNet(ResNetWrapper):
         pred_indices_and_boxes = np.concatenate((pred_batch_idx.reshape(-1, 1), pred_boxes), axis=1)
         pred_indices_and_boxes = torch.from_numpy(pred_indices_and_boxes).to(x)
 
-        # TODO write my own roi_align or roi_pool layer
-        # regions = ops.roi_pool(x, pred_indices_and_boxes.transpose(0, 2, 1, 4, 3), self.roi_align_size, self.spatial_scale)
-        # regions = ops.roi_align(x, pred_indices_and_boxes.transpose(0, 2, 1, 4, 3), self.roi_align_size, self.spatial_scale)
-        regions = ops.roi_pool(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
+        # TODO should I use roi_align?
         # regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
+        regions = ops.roi_pool(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
         y = self.avgpool(self.layer4(regions))
         y = torch.flatten(y, start_dim=1)
 
@@ -170,8 +168,6 @@ class HeadVGG16(nn.Module):
         self.fc_loc = nn.Linear(4096, num_classes * 4)
         self.fc_cls = nn.Linear(4096, num_classes)
 
-        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
-        # torch.manual_seed(20)
         self.fc_loc.weight.data.normal_(0, 0.001)
         self.fc_loc.bias.data.zero_()
         self.fc_cls.weight.data.normal_(0, 0.01)
@@ -183,14 +179,12 @@ class HeadVGG16(nn.Module):
         pred_indices_and_boxes = np.concatenate((pred_batch_idx.reshape(-1, 1).astype(np.float32), pred_boxes), axis=1)
         pred_indices_and_boxes = torch.from_numpy(pred_indices_and_boxes).to(x)
 
-        # TODO write my own roi_align or roi_pool layer
+        # TODO should I use roi_align?
         # regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
         regions = ops.roi_pool(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
         y = self.classifier(torch.flatten(regions, start_dim=1))
 
-        # pred_roi_loc = self.fc_loc(y).view(num_regions, -1, 4)
-        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
-        pred_roi_loc = self.fc_loc(y).view(num_regions, -1, 4)[:, :, [1, 0, 3, 2]]
+        pred_roi_loc = self.fc_loc(y).view(num_regions, -1, 4)
         pred_roi_cls = self.fc_cls(y)
 
         return pred_roi_cls, pred_roi_loc
@@ -205,8 +199,6 @@ class RegionProposalNetwork(nn.Module):
         self.conv_obj = nn.Conv2d(mid_channels, num_anchors * 2, 1, 1, 0)
         self.conv_loc = nn.Conv2d(mid_channels, num_anchors * 4, 1, 1, 0)
 
-        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
-        # torch.manual_seed(10)
         self.conv1.weight.data.normal_(0, 0.01)
         self.conv1.bias.data.zero_()
         self.conv_obj.weight.data.normal_(0, 0.01)
@@ -219,21 +211,7 @@ class RegionProposalNetwork(nn.Module):
         # show_feat_map(x, 'rpn feats')
         # show_feat_map(self.conv_loc(x), 'conv_loc')
         # show_feat_map(self.conv_obj(x), 'conv_obj')
-        # pred_loc_raw = self.conv_loc(x)
-        # pred_obj_raw = self.conv_obj(x)
-        #
-        # rows = torch.zeros(pred_loc_raw.shape)
-        # cols = torch.zeros(pred_loc_raw.shape)
-        # for r in range(rows.shape[-2]):
-        #     rows[:, :, r, :] = r
-        # for c in range(cols.shape[-1]):
-        #     cols[:, :, :, c] = c
-        # rows = rows.permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
-        # cols = cols.permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
-
-        # pred_loc = self.conv_loc(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
-        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
-        pred_loc = self.conv_loc(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)[:, :, [1, 0, 3, 2]].contiguous()
+        pred_loc = self.conv_loc(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
         pred_obj = self.conv_obj(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 2)
         return pred_loc, pred_obj
 
@@ -259,11 +237,6 @@ class PreprocessHead(nn.Module):
         pred_obj = pred_obj.detach()
         pred_obj_sm = torch.softmax(pred_obj, dim=2)[:, :, 1]
 
-        # import numpy as np
-        # np.random.seed(123)
-        # pred_loc = torch.tensor((np.random.randn(*pred_loc.shape) * 0.05), dtype=torch.float,
-        #                         device=anchor_boxes.device)[:, :, [1, 0, 3, 2]]
-        # pred_obj_sm = torch.tensor((np.random.rand(*pred_obj_sm.shape)), dtype=torch.float, device=pred_obj_sm.device)
         pred_boxes = get_boxes_from_loc_batch(anchor_boxes, pred_loc, img_width, img_height)
 
         pred_boxes_post_nms = []
@@ -294,55 +267,6 @@ class PreprocessHead(nn.Module):
         pred_boxes = pred_boxes.cpu().numpy()
 
         return pred_boxes, pred_batch_idx
-
-        # --- CPU version
-        # pred_obj_sm = torch.softmax(pred_obj, dim=2)
-        #
-        # torch.cuda.synchronize()
-        # t0 = time.time()
-        # pred_loc_np = pred_loc.cpu().detach().numpy()
-        # pred_obj_np = pred_obj_sm[:, :, 1].cpu().detach().numpy()
-        # torch.cuda.synchronize()
-        # print('convert to numpy', time.time() - t0)
-        #
-        # t0 = time.time()
-        # pred_boxes = get_boxes_from_loc(self.anchor_boxes, pred_loc_np, self.img_width, self.img_height)
-        # torch.cuda.synchronize()
-        # print('get boxes from loc', time.time() - t0)
-        #
-        # t0 = time.time()
-        # # not sure this can be done without a loop since each batch index may have different number of regions
-        # pred_boxes_post_nms = []
-        # for batch_idx in range(batch_size):
-        #     batch_pred_boxes = pred_boxes[batch_idx, :, :]
-        #     batch_pred_obj = pred_obj_np[batch_idx, :]
-        #
-        #     valid_boxes = (batch_pred_boxes[:, 2:] - batch_pred_boxes[:, :2] >= self.min_size).all(axis=1)
-        #     batch_pred_boxes = batch_pred_boxes[valid_boxes, :]
-        #     batch_pred_obj = batch_pred_obj[valid_boxes]
-        #
-        #     pred_indices = np.argsort(batch_pred_obj)[::-1]
-        #     if self.training:
-        #         pred_indices = pred_indices[:self.n_train_pre_nms]
-        #         n_post_nms = self.n_train_post_nms
-        #     else:
-        #         pred_indices = pred_indices[:self.n_test_pre_nms]
-        #         n_post_nms = self.n_test_post_nms
-        #     batch_pred_boxes = batch_pred_boxes[pred_indices, :]
-        #     batch_pred_obj = batch_pred_obj[pred_indices]
-        #
-        #     t0 = time.time()
-        #     nms = apply_nms(batch_pred_boxes, batch_pred_obj, self.nms_threshold, n_post_nms)
-        #     print('nms', time.time() - t0)
-        #
-        #     pred_boxes_post_nms.append(nms)
-        #
-        # pred_batch_idx = np.repeat(np.arange(batch_size), [b.shape[0] for b in pred_boxes_post_nms])
-        # pred_boxes = np.concatenate(pred_boxes_post_nms, axis=0)
-        # torch.cuda.synchronize()
-        # print('for loop', time.time() - t0)
-        #
-        # return pred_boxes, pred_batch_idx
 
 
 class TrainingProposalSelector:
