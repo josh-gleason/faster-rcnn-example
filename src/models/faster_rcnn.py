@@ -6,6 +6,34 @@ from torchvision.models.utils import load_state_dict_from_url
 import torchvision.ops as ops
 import numpy as np
 from utils.box_utils import compute_iou, choose_anchor_subset, get_loc_labels, get_boxes_from_loc_batch
+import matplotlib.pyplot as plt
+
+
+def show_feat_map(x, title='feats'):
+    x_np = x[0, ...].detach().cpu().numpy()
+    ch = x.shape[1]
+    r = ch // 2**int(np.ceil(np.log2(ch) / 2))
+    c = ch // r
+    # r = c = int(np.ceil(ch**0.5))
+    h, w = x.shape[-2:]
+    res = np.zeros((r * h, c * w))
+    for row in range(r):
+        for col in range(c):
+            ch_id = row * c + col
+            if ch_id < ch:
+                x_ch = x_np[ch_id, :, :]
+                mn = np.min(x_ch)
+                mx = np.max(x_ch)
+                if mx - mn > 0:
+                    res[row * h:(row + 1) * h, col * w:(col + 1) * w] = (x_ch - mn) / (mx - mn)
+                else:
+                    res[row * h:(row + 1) * h, col * w:(col + 1) * w] = x_ch * 0.0
+    fig = plt.figure(figsize=(10, 8), dpi=80)
+    ax = fig.subplots()
+    ax.imshow(res)
+    ax.set_title(title + ' mine')
+    fig.show()
+    # breakpoint()
 
 
 class ResNetWrapper(resnet.ResNet):
@@ -108,6 +136,7 @@ class FeatureNetVGG16(nn.Module):
         super().__init__()
         model = vgg16(pretrained=True)
         features = list(model.features)[:30]
+        # freeze top4 conv
         for layer in features[:10]:
             for p in layer.parameters():
                 p.requires_grad = False
@@ -131,7 +160,9 @@ class HeadVGG16(nn.Module):
         model = vgg16(pretrained=True)
         classifier = model.classifier
         classifier = list(classifier)
+        # remove final fc layer
         del classifier[6]
+        # remove drop-out
         del classifier[5]
         del classifier[2]
         self.classifier = nn.Sequential(*classifier)
@@ -139,7 +170,9 @@ class HeadVGG16(nn.Module):
         self.fc_loc = nn.Linear(4096, num_classes * 4)
         self.fc_cls = nn.Linear(4096, num_classes)
 
-        self.fc_loc.weight.data.normal_(0, 0.01)
+        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
+        # torch.manual_seed(20)
+        self.fc_loc.weight.data.normal_(0, 0.001)
         self.fc_loc.bias.data.zero_()
         self.fc_cls.weight.data.normal_(0, 0.01)
         self.fc_cls.bias.data.zero_()
@@ -147,15 +180,18 @@ class HeadVGG16(nn.Module):
     def forward(self, x, pred_boxes, pred_batch_idx):
         num_regions = len(pred_batch_idx)
 
-        pred_indices_and_boxes = np.concatenate((pred_batch_idx.reshape(-1, 1), pred_boxes), axis=1)
+        pred_indices_and_boxes = np.concatenate((pred_batch_idx.reshape(-1, 1).astype(np.float32), pred_boxes), axis=1)
         pred_indices_and_boxes = torch.from_numpy(pred_indices_and_boxes).to(x)
 
         # TODO write my own roi_align or roi_pool layer
-        regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
+        # regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
+        regions = ops.roi_pool(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
         y = self.classifier(torch.flatten(regions, start_dim=1))
 
+        # pred_roi_loc = self.fc_loc(y).view(num_regions, -1, 4)
+        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
+        pred_roi_loc = self.fc_loc(y).view(num_regions, -1, 4)[:, :, [1, 0, 3, 2]]
         pred_roi_cls = self.fc_cls(y)
-        pred_roi_loc = self.fc_loc(y).view(num_regions, -1, 4)
 
         return pred_roi_cls, pred_roi_loc
 
@@ -166,29 +202,45 @@ class RegionProposalNetwork(nn.Module):
         self.num_anchors = num_anchors
 
         self.conv1 = nn.Conv2d(in_channels, mid_channels, 3, 1, 1)
-        self.conv_loc = nn.Conv2d(mid_channels, num_anchors * 4, 1, 1, 0)
         self.conv_obj = nn.Conv2d(mid_channels, num_anchors * 2, 1, 1, 0)
+        self.conv_loc = nn.Conv2d(mid_channels, num_anchors * 4, 1, 1, 0)
 
+        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
+        # torch.manual_seed(10)
         self.conv1.weight.data.normal_(0, 0.01)
         self.conv1.bias.data.zero_()
-        self.conv_loc.weight.data.normal_(0, 0.01)
-        self.conv_loc.bias.data.zero_()
         self.conv_obj.weight.data.normal_(0, 0.01)
         self.conv_obj.bias.data.zero_()
+        self.conv_loc.weight.data.normal_(0, 0.01)
+        self.conv_loc.bias.data.zero_()
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
-        pred_loc = self.conv_loc(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
+        # show_feat_map(x, 'rpn feats')
+        # show_feat_map(self.conv_loc(x), 'conv_loc')
+        # show_feat_map(self.conv_obj(x), 'conv_obj')
+        # pred_loc_raw = self.conv_loc(x)
+        # pred_obj_raw = self.conv_obj(x)
+        #
+        # rows = torch.zeros(pred_loc_raw.shape)
+        # cols = torch.zeros(pred_loc_raw.shape)
+        # for r in range(rows.shape[-2]):
+        #     rows[:, :, r, :] = r
+        # for c in range(cols.shape[-1]):
+        #     cols[:, :, :, c] = c
+        # rows = rows.permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
+        # cols = cols.permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
+
+        # pred_loc = self.conv_loc(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
+        # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
+        pred_loc = self.conv_loc(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)[:, :, [1, 0, 3, 2]].contiguous()
         pred_obj = self.conv_obj(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 2)
         return pred_loc, pred_obj
 
 
 class PreprocessHead(nn.Module):
-    def __init__(self, anchor_boxes, img_shape=(1000, 1000)):
+    def __init__(self):
         super().__init__()
-        self.anchor_boxes = torch.from_numpy(anchor_boxes)
-
-        self.img_height, self.img_width = img_shape
         self.n_train_pre_nms = 12000
         self.n_train_post_nms = 2000
         self.n_test_pre_nms = 6000
@@ -196,16 +248,23 @@ class PreprocessHead(nn.Module):
         self.min_size = 16
         self.nms_threshold = 0.7
 
-    def __call__(self, pred_loc, pred_obj):
+    def __call__(self, img_shape, anchor_boxes, pred_loc, pred_obj):
+        img_height, img_width = img_shape
+        # currently batch size 1 supported only
+        assert anchor_boxes.shape[0] == 1
+        anchor_boxes = anchor_boxes[0]
         batch_size = pred_loc.shape[0]
 
         pred_loc = pred_loc.detach()
         pred_obj = pred_obj.detach()
-        anchor_boxes = self.anchor_boxes.to(device=pred_loc.device)
-
         pred_obj_sm = torch.softmax(pred_obj, dim=2)[:, :, 1]
 
-        pred_boxes = get_boxes_from_loc_batch(anchor_boxes, pred_loc, self.img_width, self.img_height)
+        # import numpy as np
+        # np.random.seed(123)
+        # pred_loc = torch.tensor((np.random.randn(*pred_loc.shape) * 0.05), dtype=torch.float,
+        #                         device=anchor_boxes.device)[:, :, [1, 0, 3, 2]]
+        # pred_obj_sm = torch.tensor((np.random.rand(*pred_obj_sm.shape)), dtype=torch.float, device=pred_obj_sm.device)
+        pred_boxes = get_boxes_from_loc_batch(anchor_boxes, pred_loc, img_width, img_height)
 
         pred_boxes_post_nms = []
         for batch_idx in range(batch_size):
@@ -320,10 +379,15 @@ class TrainingProposalSelector:
                 max_iou = iou[range(iou.shape[0]), max_iou_gt_idx]
 
                 pred_positive_idx = np.nonzero(max_iou > self.pos_iou_thresh)[0]
+                # pred_positive_idx = np.array([7, 9, 10, 21, 37, 51, 100, 161, 184, 208, 212,
+                #        268, 277, 311, 315, 443, 464, 636, 820, 873, 973, 1108,
+                #        1218, 1319, 1340, 1562, 1581, 1698, 1699, 1910, 1912, 2000, 2001,
+                #        2002])
                 gt_positive_idx = max_iou_gt_idx[pred_positive_idx]
 
                 pred_negative_idx = np.nonzero((max_iou < self.neg_iou_thresh_hi) &
                                                (max_iou >= self.neg_iou_thresh_low))[0]
+                # pred_negative_idx = np.load('/home/gleason/temp.npy', allow_pickle=True)
             else:
                 pred_positive_idx = np.zeros((0,), dtype=np.int32)
                 gt_positive_idx = np.zeros((0,), dtype=np.int32)
@@ -370,27 +434,34 @@ class TrainingProposalSelector:
 
 
 class FasterRCNN(nn.Module):
-    def __init__(self, anchor_boxes, num_anchors=9, num_classes=92, return_rpn_output=False, arch='vgg16',
-                 img_shape=(1000, 1000)):
+    def __init__(self, num_anchors=9, num_classes=92, return_rpn_output=False, arch='vgg16'):
         super().__init__()
         self.return_rpn_output = return_rpn_output
 
         self.feature_net = FeatureNetVGG16() if arch == 'vgg16' else FeatureNetResNet(arch)
         self.region_proposal_network = RegionProposalNetwork(num_anchors,
                                                              self.feature_net.get_out_channels())
-        self.preprocess_head = PreprocessHead(anchor_boxes, img_shape=img_shape)
+        self.preprocess_head = PreprocessHead()
         self.head = HeadVGG16(num_classes) if arch == 'vgg16' else HeadResNet(num_classes, arch)
         self.training_proposal_selector = TrainingProposalSelector()
 
-    def forward(self, x, initial_batch_idx, gt_boxes=None, gt_class_labels=None, gt_count=None):
+    def forward(self, x, anchor_boxes, initial_batch_idx, gt_boxes=None, gt_class_labels=None, gt_count=None):
         if self.training:
             assert gt_boxes is not None and gt_count is not None and gt_class_labels is not None
 
+        # fig = plt.figure(figsize=(10, 10), dpi=80)
+        # ax = fig.subplots()
+        # ax.imshow(x[0, ...].cpu().numpy().transpose(1, 2, 0))
+        # fig.show()
+
+        input_shape = x.shape[-2:]
         x = self.feature_net(x)
+
+        # show_feat_map(x)
 
         pred_loc, pred_obj = self.region_proposal_network(x)
         with torch.no_grad():
-            pred_roi_boxes, pred_roi_batch_idx = self.preprocess_head(pred_loc, pred_obj)
+            pred_roi_boxes, pred_roi_batch_idx = self.preprocess_head(input_shape, anchor_boxes, pred_loc, pred_obj)
             if self.training:
                 pred_roi_boxes, pred_roi_batch_idx, pred_roi_cls_labels, pred_roi_loc_labels \
                     = self.training_proposal_selector(pred_roi_boxes, pred_roi_batch_idx,

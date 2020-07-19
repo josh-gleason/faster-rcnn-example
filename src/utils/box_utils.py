@@ -28,6 +28,9 @@ def choose_anchor_subset(num_samples, pos_ratio, len_positive, len_negative):
         # if this assert fails then reduce num_samples or loosen the thresholds
         assert num_positive <= len_positive
 
+    # TODO THIS IS TEMPORARY SHOULD BE REMOVED!!!
+    # positive_choice = np.arange(num_positive)
+    # negative_choice = np.arange(num_negative)
     positive_choice = np.random.choice(np.arange(len_positive), num_positive, replace=False)
     negative_choice = np.random.choice(np.arange(len_negative), num_negative, replace=False)
 
@@ -99,6 +102,7 @@ def get_boxes_from_loc(anchor_boxes, loc, img_width, img_height, loc_mean=None, 
     neg_pos = np.array([-0.5, 0.5], dtype=np.float32).reshape(1, 2, 1)
     boxes = (boxes_center_x_y + neg_pos * boxes_width_height).reshape(-1, 4)
 
+    # TODO should this be img_width - 1 and img_height - 1?
     boxes[:, ::2] = np.clip(boxes[:, ::2], 0, img_width) * (orig_width / img_width)
     boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, img_height) * (orig_height / img_height)
 
@@ -109,7 +113,7 @@ def define_anchor_boxes(sub_sample, width, height):
     feature_map_w, feature_map_h = (width // sub_sample), (height // sub_sample)
 
     # using np.array
-    ratios = np.array((0.5, 1, 2), dtype=np.float32).reshape(-1, 1)
+    ratios = np.array((2, 1, 0.5), dtype=np.float32).reshape(-1, 1)
     anchor_scales = np.array((8, 16, 32), dtype=np.float32).reshape(1, -1)
     anchor_base_x = (sub_sample * anchor_scales * np.sqrt(ratios) / 2).reshape(1, -1, 1, 1)
     anchor_base_y = (sub_sample * anchor_scales * np.sqrt(1.0 / ratios) / 2).reshape(1, -1, 1, 1)
@@ -179,6 +183,182 @@ def apply_nms(boxes, scores, threshold, n_results=-1, return_scores=False):
     return output
 
 
+def get_bboxes_from_output3(output, resized_shapes, orig_shapes, score_thresh=0.05, nms_thresh=0.3):
+    def loc2bbox(src_bbox, loc):
+        if src_bbox.shape[0] == 0:
+            return np.zeros((0, 4), dtype=loc.dtype)
+
+        src_bbox = src_bbox.astype(src_bbox.dtype, copy=False)
+
+        src_height = src_bbox[:, 2] - src_bbox[:, 0]
+        src_width = src_bbox[:, 3] - src_bbox[:, 1]
+        src_ctr_y = src_bbox[:, 0] + 0.5 * src_height
+        src_ctr_x = src_bbox[:, 1] + 0.5 * src_width
+
+        dy = loc[:, 0::4]
+        dx = loc[:, 1::4]
+        dh = loc[:, 2::4]
+        dw = loc[:, 3::4]
+
+        ctr_y = dy * src_height[:, np.newaxis] + src_ctr_y[:, np.newaxis]
+        ctr_x = dx * src_width[:, np.newaxis] + src_ctr_x[:, np.newaxis]
+        h = np.exp(dh) * src_height[:, np.newaxis]
+        w = np.exp(dw) * src_width[:, np.newaxis]
+
+        dst_bbox = np.zeros(loc.shape, dtype=loc.dtype)
+        dst_bbox[:, 0::4] = ctr_y - 0.5 * h
+        dst_bbox[:, 1::4] = ctr_x - 0.5 * w
+        dst_bbox[:, 2::4] = ctr_y + 0.5 * h
+        dst_bbox[:, 3::4] = ctr_x + 0.5 * w
+
+        return dst_bbox
+
+    def suppress(raw_cls_bbox, raw_prob, n_class):
+        bbox = list()
+        label = list()
+        score = list()
+        # skip cls_id = 0 because it is the background class
+        for l in range(1, n_class):
+            cls_bbox_l = raw_cls_bbox.reshape((-1, n_class, 4))[:, l, :]
+            prob_l = raw_prob[:, l]
+            mask = prob_l > score_thresh
+            cls_bbox_l = cls_bbox_l[mask]
+            prob_l = prob_l[mask]
+            keep = ops.nms(cls_bbox_l, prob_l, nms_thresh)
+            bbox.append(cls_bbox_l[keep].cpu().numpy())
+            label.append(l * np.ones((len(keep),)))
+            score.append(prob_l[keep].cpu().numpy())
+        bbox = np.concatenate(bbox, axis=0).astype(np.float32)
+        label = np.concatenate(label, axis=0).astype(np.int32)
+        score = np.concatenate(score, axis=0).astype(np.float32)
+        return bbox, label, score
+
+    all_pred_roi_cls = output['pred_roi_cls'].detach().cpu().numpy()
+    all_pred_roi_batch_idx = output['pred_roi_batch_idx'].detach().cpu().numpy()
+    all_pred_roi_boxes = output['pred_roi_boxes'].detach().cpu().numpy()
+    all_pred_roi_loc = output['pred_roi_loc'].detach().cpu().numpy()
+
+    dtype = all_pred_roi_loc.dtype
+
+    final_preds = []
+    batch_indices = np.sort(np.unique(all_pred_roi_batch_idx))
+    for batch_idx in batch_indices:
+        final_preds.append(defaultdict(lambda: {'rects': [], 'confs': []}))
+
+        resized_shape = np.array(resized_shapes[batch_idx], dtype=dtype)
+        orig_shape = np.array(orig_shapes[batch_idx], dtype=dtype)
+
+        # start working in y/x land
+        pred_roi_cls = all_pred_roi_cls[all_pred_roi_batch_idx == batch_idx]
+        pred_roi_boxes = all_pred_roi_boxes[all_pred_roi_batch_idx == batch_idx, :][:, [1, 0, 3, 2]]
+        pred_roi_loc = all_pred_roi_loc[all_pred_roi_batch_idx == batch_idx, ...][:, :, [1, 0, 3, 2]]
+        n_classes = pred_roi_loc.shape[1]
+
+        pred_roi_cls = torch.tensor(pred_roi_cls).cuda()
+        pred_roi_boxes = torch.tensor(pred_roi_boxes).cuda()
+        pred_roi_loc = torch.tensor(pred_roi_loc.reshape((pred_roi_loc.shape[0], -1))).cuda()
+
+        scale = resized_shape[1] / orig_shape[1]
+
+        pred_roi_boxes = pred_roi_boxes / scale
+
+        # Convert predictions to bounding boxes in image coordinates.
+        # Bounding boxes are scaled to the scale of the input images.
+        mean = torch.tensor([0., 0., 0., 0.], dtype=torch.float).cuda().repeat(n_classes)[None]
+        std = torch.tensor([0.1, 0.1, 0.2, 0.2], dtype=torch.float).cuda().repeat(n_classes)[None]
+
+        pred_roi_loc = (pred_roi_loc * std + mean)
+        pred_roi_loc = pred_roi_loc.view(-1, n_classes, 4)
+        pred_roi_boxes = pred_roi_boxes.view(-1, 1, 4).expand_as(pred_roi_loc)
+        cls_bbox = loc2bbox(pred_roi_boxes.detach().cpu().numpy().reshape((-1, 4)),
+                            pred_roi_loc.detach().cpu().numpy().reshape((-1, 4)))
+        cls_bbox = torch.tensor(cls_bbox).cuda()
+        cls_bbox = cls_bbox.view(-1, n_classes * 4)
+        # clip bounding box
+        cls_bbox[:, 0::2] = (cls_bbox[:, 0::2]).clamp(min=0, max=orig_shape[0])
+        cls_bbox[:, 1::2] = (cls_bbox[:, 1::2]).clamp(min=0, max=orig_shape[1])
+
+        prob = (torch.softmax(pred_roi_cls, dim=1))
+
+        bbox, label, score = suppress(cls_bbox, prob, n_classes)
+
+        bbox = bbox[:, [1, 0, 3, 2]]
+        # end working in y/x land
+        for idx in range(label.size):
+            final_preds[-1][label[idx].item()]['rects'].append(bbox[idx, :])
+            final_preds[-1][label[idx].item()]['confs'].append(score[idx])
+        for k in final_preds[-1]:
+            final_preds[-1][k]['rects'] = np.array(final_preds[-1][k]['rects'], dtype=np.float32)
+            final_preds[-1][k]['confs'] = np.array(final_preds[-1][k]['confs'], dtype=np.float32)
+
+    return final_preds, batch_indices
+
+
+def get_bboxes_from_output2(output, resized_shapes, orig_shapes, score_thresh=0.05, nms_thresh=0.3):
+    all_pred_roi_cls_sm = torch.softmax(output['pred_roi_cls'], dim=1).detach().cpu().numpy()
+    all_pred_roi_batch_idx = output['pred_roi_batch_idx'].detach().cpu().numpy()
+    all_pred_roi_boxes = output['pred_roi_boxes'].detach().cpu().numpy()
+    all_pred_roi_loc = output['pred_roi_loc'].detach().cpu().numpy()
+
+    dtype = all_pred_roi_loc.dtype
+
+    final_preds = []
+    batch_indices = np.sort(np.unique(all_pred_roi_batch_idx))
+    for batch_idx in batch_indices:
+        img_height, img_width = orig_shapes[batch_idx]
+        resized_shape = np.array(resized_shapes[batch_idx], dtype=dtype)
+        orig_shape = np.array(orig_shapes[batch_idx], dtype=dtype)
+
+        scale_xy = orig_shape[None, None, ::-1] / resized_shape[None, None, ::-1]
+
+        pred_roi_cls_sm = all_pred_roi_cls_sm[all_pred_roi_batch_idx == batch_idx]
+        pred_roi_boxes = all_pred_roi_boxes[all_pred_roi_batch_idx == batch_idx, :]
+        pred_roi_loc = all_pred_roi_loc[all_pred_roi_batch_idx == batch_idx, ...]
+
+        # apply pred_roi_loc correction to pred_roi_boxes and scale to orig_shape
+        loc_mean = np.array((0., 0., 0., 0.), dtype=dtype)[None, None, :]
+        loc_std = np.array((0.1, 0.1, 0.2, 0.2), dtype=dtype)[None, None, :]
+        pred_roi_loc = pred_roi_loc * loc_std + loc_mean
+
+        pred_roi_boxes_w_h = (pred_roi_boxes[:, None, 2:] - pred_roi_boxes[:, None, :2]) * scale_xy
+        pred_roi_boxes_ctr_x_y = 0.5 * (pred_roi_boxes[:, None, :2] + pred_roi_boxes[:, None, 2:]) * scale_xy
+
+        dxy = pred_roi_loc[:, :, :2]
+        dwh = pred_roi_loc[:, :, 2:]
+
+        pred_result_boxes_ctr_x_y = pred_roi_boxes_ctr_x_y + dxy * pred_roi_boxes_w_h
+        pred_result_boxes_w_h = np.exp(dwh) * pred_roi_boxes_w_h
+
+        pred_result_boxes = np.zeros(pred_roi_loc.shape, dtype=dtype)
+        pred_result_boxes[:, :, :2] = pred_result_boxes_ctr_x_y - 0.5 * pred_result_boxes_w_h
+        pred_result_boxes[:, :, 2:] = pred_result_boxes_ctr_x_y + 0.5 * pred_result_boxes_w_h
+
+        # clamp to original image bounds
+        # TODO should this be img_width - 1 and img_height - 1?
+        pred_result_boxes[:, :, ::2] = np.clip(pred_result_boxes[:, :, ::2], 0, img_width)
+        pred_result_boxes[:, :, 1::2] = np.clip(pred_result_boxes[:, :, 1::2], 0, img_height)
+
+        # suppress boxes based on score and add to final dict
+        final_preds.append(defaultdict(lambda: {'rects': [], 'confs': []}))
+        for class_idx in range(1, pred_roi_cls_sm.shape[1]):
+            class_boxes = pred_result_boxes[:, class_idx, :]
+            class_scores = pred_roi_cls_sm[:, class_idx]
+            keep_mask = class_scores > score_thresh
+            class_boxes = class_boxes[keep_mask, :]
+            class_scores = class_scores[keep_mask]
+            if class_boxes.size > 0:
+                keep_index = ops.nms(
+                    torch.from_numpy(class_boxes).cuda(),
+                    torch.from_numpy(class_scores).cuda(),
+                    nms_thresh).cpu().numpy()
+                class_boxes = class_boxes[keep_index, :]
+                class_scores = class_scores[keep_index]
+            if class_boxes.size > 0:
+                final_preds[-1][class_idx]['rects'] = class_boxes
+                final_preds[-1][class_idx]['confs'] = class_scores
+    return final_preds, batch_indices
+
+
 def get_bboxes_from_output(output, resized_shapes, orig_shapes, threshold=0.0):
     all_pred_roi_cls = torch.softmax(output['pred_roi_cls'], dim=1).detach().cpu().numpy()
     all_pred_roi_batch_idx = output['pred_roi_batch_idx'].detach().cpu().numpy()
@@ -243,7 +423,9 @@ def get_anchor_labels(anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh,
 
         anchor_positive_index1 = np.argmax(iou, axis=0) if mark_max_gt_anchors \
             else np.empty(0, dtype=np.int32)
-        anchor_positive_index2 = np.nonzero(anchor_max_iou > pos_iou_thresh)[0]
+        # handle tied cases robustly
+        anchor_positive_index1 = np.nonzero(iou == anchor_max_iou[anchor_positive_index1])[0]
+        anchor_positive_index2 = np.nonzero(anchor_max_iou >= pos_iou_thresh)[0]
         anchor_positive_index = np.unique(
             np.append(anchor_positive_index1, anchor_positive_index2))
         anchor_negative_index = np.nonzero(anchor_max_iou < neg_iou_thresh)[0]
