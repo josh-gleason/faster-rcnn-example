@@ -1,8 +1,8 @@
 import numpy as np
-import time
 import torch
 from collections import defaultdict
 from torchvision import ops
+from utils.data_mappings import coco_id_to_name, voc_id_to_name
 
 
 def compute_iou(boxes1, boxes2):
@@ -56,8 +56,21 @@ def get_loc_labels(anchor_boxes, gt_boxes, loc_mean=None, loc_std=None):
     return loc
 
 
-def get_boxes_from_loc_batch(anchor_boxes, loc, img_width, img_height, loc_mean=None, loc_std=None):
-    # assumes loc is provided with a batch dimension at dim 0
+def get_boxes_from_loc_batch(anchor_boxes, loc, img_height, img_width, loc_mean=None, loc_std=None):
+    """ Convert batch of loc predictions (as torch.tensors) to bounding boxes.
+
+    Args:
+        anchor_boxes (torch.tensor): Shape (N, 4)
+        loc (torch.tensor): Shape (B, N, 4)
+        img_width (int): Image width
+        img_height (int): Image height
+        loc_mean (torch.tensor, optional): Shape (4,). Used to un-normalize loc.
+        loc_std (torch.tensor, optional): Shape (4,). Used to un-normalize loc.
+
+    Returns:
+        torch.tensor: Shape (B, N, 4). Converts all loc predictions to bounding boxes (clamped to
+            image bounds).
+    """
     batch_size = loc.shape[0]
 
     if loc_mean is not None:
@@ -80,43 +93,79 @@ def get_boxes_from_loc_batch(anchor_boxes, loc, img_width, img_height, loc_mean=
     return boxes
 
 
-def get_boxes_from_loc(anchor_boxes, loc, img_width, img_height, loc_mean=None, loc_std=None,
-                       orig_width=None, orig_height=None):
+def get_boxes_from_loc_multiclass(anchor_boxes, loc, img_width, img_height, loc_mean=None, loc_std=None):
+    """ Convert loc predictions to bounding boxes for loc predictions applied to multiple loc predictions.
+
+    Args:
+        anchor_boxes (np.array or torch.tensor): Shape (N, 4)
+        loc (np.array or torch.tensor): Shape (N, C, 4)
+        img_width (int): Image width used to clamp results
+        img_height (int): Image height used to clamp final result
+        loc_mean (np.array or torch.tensor, optional): Shape (4,). Used to un-normalize loc.
+        loc_std (np.array or torch.tensor, optional): Shape (4,). Used to un-normalize loc.
+
+    Returns:
+        np.array or torch.tensor: Shape (N, C, 4). Converts all loc predictions to bounding boxes (clamped to
+            image bounds).
+    """
+    if loc_mean is not None:
+        loc = loc * loc_std.reshape(1, 1, 4) + loc_mean.reshape(1, 1, 4)
+
+    anchor_center_xy = 0.5 * (anchor_boxes[:, None, None, :2] + anchor_boxes[:, None, None, 2:])
+    anchor_wh = anchor_boxes[:, None, None, 2:] - anchor_boxes[:, None, None, :2]
+
+    boxes_center_xy = loc[:, :, None, :2] * anchor_wh + anchor_center_xy
+    boxes_wh = (np.exp(loc[:, :, None, 2:]) * anchor_wh)
+
+    # add -0.5 and 0.5 times width and height to centers to construct final output
+    neg_pos = np.array([-0.5, 0.5], dtype=loc.dtype).reshape(1, 1, 2, 1)
+    boxes = boxes_center_xy + neg_pos * boxes_wh
+
+    # clamp
+    boxes = np.clip(boxes, 0, np.array([img_width - 1, img_height - 1], dtype=loc.dtype).reshape(1, 1, 1, 2))
+
+    return boxes.reshape(*loc.shape)
+
+
+def get_boxes_from_loc(anchor_boxes, loc, img_width, img_height, loc_mean=None, loc_std=None):
+    """ Convert loc predictions to bounding boxes.
+
+    Args:
+        anchor_boxes (np.ndarray): Shape (N, 4)
+        loc (np.ndarray): Shape (N, 4)
+        img_width (int): Image width used to clamp results
+        img_height (int): Image height used to clamp final result
+        loc_mean (np.ndarray, optional): Shape (4,). Used to un-normalize loc.
+        loc_std (np.ndarray, optional): Shape (4,). Used to un-normalize loc.
+
+    Returns:
+        np.array: Shape (N, 4). Converts all loc predictions to bounding boxes.
+    """
     if loc_mean is not None:
         loc = loc * loc_std.reshape(1, 4) + loc_mean.reshape(1, 4)
 
-    if orig_width is None:
-        orig_width = img_width
-    if orig_height is None:
-        orig_height = img_height
+    anchor_center_xy = 0.5 * (anchor_boxes[:, None, :2] + anchor_boxes[:, None, 2:])
+    anchor_wh = anchor_boxes[:, None, 2:] - anchor_boxes[:, None, :2]
 
-    # define scale to convert boxes back to original image coords
-    if float(img_width) / orig_width < float(img_height) / orig_height:
-        scale = float(img_width) / orig_width
-    else:
-        scale = float(img_height) / orig_height
+    boxes_center_xy = loc[:, None, :2] * anchor_wh + anchor_center_xy
+    boxes_wh = (np.exp(loc[:, None, 2:]) * anchor_wh)
 
-    anchor_center_x_y = 0.5 * (anchor_boxes[:, None, :2] + anchor_boxes[:, None, 2:])
-    anchor_width_height = anchor_boxes[:, None, 2:] - anchor_boxes[:, None, :2]
+    neg_pos = np.array([-0.5, 0.5], dtype=loc.dtype).reshape(1, 2, 1)
+    boxes = (boxes_center_xy + neg_pos * boxes_wh).reshape(-1, 4)
 
-    boxes_center_x_y = loc[:, None, :2] * anchor_width_height + anchor_center_x_y
-    boxes_width_height = (np.exp(loc[:, None, 2:]) * anchor_width_height)
-
-    neg_pos = np.array([-0.5, 0.5], dtype=np.float32).reshape(1, 2, 1)
-    boxes = (boxes_center_x_y + neg_pos * boxes_width_height).reshape(-1, 4) / scale
-
-    boxes[:, ::2] = np.clip(boxes[:, ::2], 0, orig_width)
-    boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, orig_height)
+    # clamp
+    boxes[:, ::2] = np.clip(boxes[:, ::2], 0, img_width - 1)
+    boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, img_height - 1)
 
     return boxes
 
 
-def define_anchor_boxes(sub_sample, width, height, ratios=(0.5, 1.0, 2.0), scales=(8, 16, 32)):
+def define_anchor_boxes(sub_sample, height, width):
     feature_map_w, feature_map_h = (width // sub_sample), (height // sub_sample)
 
     # using np.array
-    ratios = np.array(ratios, dtype=np.float32).reshape(-1, 1)
-    anchor_scales = np.array(scales, dtype=np.float32).reshape(1, -1)
+    ratios = np.array((2, 1, 0.5), dtype=np.float32).reshape(-1, 1)
+    anchor_scales = np.array((8, 16, 32), dtype=np.float32).reshape(1, -1)
     anchor_base_x = (sub_sample * anchor_scales * np.sqrt(ratios) / 2).reshape(1, -1, 1, 1)
     anchor_base_y = (sub_sample * anchor_scales * np.sqrt(1.0 / ratios) / 2).reshape(1, -1, 1, 1)
     ctr_x, ctr_y = np.meshgrid(
@@ -127,115 +176,58 @@ def define_anchor_boxes(sub_sample, width, height, ratios=(0.5, 1.0, 2.0), scale
     neg_pos = np.array([-1.0, 1.0], dtype=np.float32).reshape(1, 1, -1, 1)
     anchors_x = ctr_x + (anchor_base_x * neg_pos)
     anchors_y = ctr_y + (anchor_base_y * neg_pos)
-    anchor_boxes = np.stack((anchors_x, anchors_y), axis=3).reshape(-1, 4)
+    anchor_boxes = np.concatenate((anchors_x, anchors_y), axis=3).reshape(-1, 4)
 
     return anchor_boxes
 
 
-def apply_nms(boxes, scores, threshold, n_results=-1, return_scores=False):
-    if len(scores) == 0:
-        if return_scores:
-            return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-        else:
-            return np.zeros((0, 4), dtype=np.float32)
-
-    t0 = time.time()
-    idxs = np.argsort(scores)
-    areas = np.prod(boxes[:, 2:] - boxes[:, :2], axis=1)
-    print('compute areas', time.time() - t0)
-
-    final_boxes = []
-    if return_scores:
-        final_scores = []
-    discard = set()
-    compute_time = 0.0
-    discard_time = 0.0
-    for last in reversed(range(len(idxs))):
-        if last not in discard:
-            final_boxes.append(boxes[idxs[last], :])
-            if return_scores:
-                final_scores.append(scores[idxs[last]])
-
-            if n_results > 0 and len(final_boxes) >= n_results:
-                break
-
-            t0 = time.time()
-            int_left_top = np.maximum(boxes[last, :2], boxes[:last, :2])
-            int_right_bot = np.minimum(boxes[last, 2:], boxes[:last, 2:])
-            int_width_height = np.maximum(0, int_right_bot - int_left_top)
-            int_areas = np.prod(int_width_height, axis=1)
-            union_areas = areas[last] + areas[:last] - int_areas
-            iou = int_areas / union_areas
-            compute_time += time.time() - t0
-
-            t0 = time.time()
-            discard.update(np.nonzero(iou > threshold)[0])
-            discard_time += time.time() - t0
-
-    print('compute iou time', compute_time)
-    print('discard iou time', discard_time)
-
-    t0 = time.time()
-    if return_scores:
-        output = (np.array(final_boxes, dtype=np.float32), np.array(final_scores, dtype=np.float32))
-    else:
-        output = np.array(final_boxes, dtype=np.float32)
-    print('build output', time.time() - t0)
-
-    return output
-
-
-def get_bboxes_from_output(output, resized_shapes, orig_shapes, threshold=0.0):
-    all_pred_roi_cls = torch.softmax(output['pred_roi_cls'], dim=1).detach().cpu().numpy()
+def get_boxes_from_output(output, resized_shapes, orig_shapes, score_thresh=0.05, nms_thresh=0.3):
+    all_pred_roi_cls_sm = torch.softmax(output['pred_roi_cls'], dim=1).detach().cpu().numpy()
     all_pred_roi_batch_idx = output['pred_roi_batch_idx'].detach().cpu().numpy()
     all_pred_roi_boxes = output['pred_roi_boxes'].detach().cpu().numpy()
     all_pred_roi_loc = output['pred_roi_loc'].detach().cpu().numpy()
 
+    dtype = all_pred_roi_loc.dtype
+
     final_preds = []
     batch_indices = np.sort(np.unique(all_pred_roi_batch_idx))
     for batch_idx in batch_indices:
-        resized_shape = resized_shapes[batch_idx]
-        orig_shape = orig_shapes[batch_idx]
+        img_height, img_width = orig_shapes[batch_idx]
 
-        pred_roi_cls = all_pred_roi_cls[all_pred_roi_batch_idx == batch_idx]
+        pred_roi_cls_sm = all_pred_roi_cls_sm[all_pred_roi_batch_idx == batch_idx]
         pred_roi_boxes = all_pred_roi_boxes[all_pred_roi_batch_idx == batch_idx, :]
-        pred_roi_loc = all_pred_roi_loc[all_pred_roi_batch_idx == batch_idx, :]
+        pred_roi_loc = all_pred_roi_loc[all_pred_roi_batch_idx == batch_idx, ...]
 
-        pred_cls = np.argmax(pred_roi_cls, axis=1)
-        pred_conf = np.max(pred_roi_cls, axis=1)
-        keep_idx = np.nonzero(pred_cls > 0)[0]
+        # scale pred_roi_boxes to original image coordinates
+        resized_shape = np.array(resized_shapes[batch_idx], dtype=dtype)
+        orig_shape = np.array(orig_shapes[batch_idx], dtype=dtype)
+        scale_xyxy = np.tile((orig_shape[None, ::-1] / resized_shape[None, ::-1]), (1, 2))
+        pred_roi_boxes = pred_roi_boxes * scale_xyxy
 
-        final_preds.append(defaultdict(lambda: {'rects': [], 'confs': []}))
-        if len(keep_idx) > 0:
-            pred_cls = pred_cls[keep_idx]
-            pred_conf = pred_conf[keep_idx]
-            pred_boxes = pred_roi_boxes[keep_idx]
-            pred_loc = pred_roi_loc[keep_idx, pred_cls, :]
+        # apply pred_roi_loc corrections to pred_roi_boxes
+        pred_result_boxes = get_boxes_from_loc_multiclass(
+            pred_roi_boxes, pred_roi_loc, img_width, img_height,
+            loc_mean=np.array((0.0, 0.0, 0.0, 0.0), dtype=pred_roi_loc.dtype),
+            loc_std=np.array((0.1, 0.1, 0.2, 0.2), dtype=pred_roi_loc.dtype))
 
-            rects = get_boxes_from_loc(pred_boxes, pred_loc,
-                                       img_width=resized_shape[0], img_height=resized_shape[1],
-                                       loc_mean=np.array((0., 0., 0., 0.)),
-                                       loc_std=np.array((0.1, 0.1, 0.2, 0.2)),
-                                       orig_width=orig_shape[0], orig_height=orig_shape[1])
-            pre_nms = defaultdict(list)
-            for rect, conf, cls in zip(rects, pred_conf, pred_cls):
-                if cls > 0:
-                    pre_nms[cls].append((rect, conf))
-
-            for cls in pre_nms:
-                cls_rects, cls_conf = zip(*pre_nms[cls])
-                cls_rects = np.concatenate([c.reshape(1, -1) for c in cls_rects], axis=0)
-                cls_conf = np.array(cls_conf)
-
-                cls_rects = torch.from_numpy(cls_rects).float()
-                cls_conf = torch.from_numpy(cls_conf).float()
-                keep_nms = ops.nms(cls_rects.cuda(), cls_conf.cuda(), 0.3).cpu()
-                keep_nms = keep_nms[np.nonzero(cls_conf[keep_nms].numpy() >= threshold)[0]]
-
-                if len(keep_nms) > 0:
-                    final_preds[-1][cls]['rects'] = cls_rects[keep_nms].numpy()
-                    final_preds[-1][cls]['confs'] = cls_conf[keep_nms].numpy()
-
+        # suppress boxes based on score and add to final dict
+        final_preds.append(defaultdict(lambda: {'rects': np.zeros((0, 4)), 'confs': np.zeros((0,))}))
+        for class_idx in range(1, pred_roi_cls_sm.shape[1]):
+            class_boxes = pred_result_boxes[:, class_idx, :]
+            class_scores = pred_roi_cls_sm[:, class_idx]
+            keep_mask = class_scores > score_thresh
+            class_boxes = class_boxes[keep_mask, :]
+            class_scores = class_scores[keep_mask]
+            if class_boxes.size > 0:
+                keep_index = ops.nms(
+                    torch.from_numpy(class_boxes),
+                    torch.from_numpy(class_scores),
+                    nms_thresh).cpu().numpy()
+                class_boxes = class_boxes[keep_index, :]
+                class_scores = class_scores[keep_index]
+            if class_boxes.size > 0:
+                final_preds[-1][class_idx]['rects'] = class_boxes
+                final_preds[-1][class_idx]['confs'] = class_scores
     return final_preds, batch_indices
 
 
@@ -249,7 +241,9 @@ def get_anchor_labels(anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh,
 
         anchor_positive_index1 = np.argmax(iou, axis=0) if mark_max_gt_anchors \
             else np.empty(0, dtype=np.int32)
-        anchor_positive_index2 = np.nonzero(anchor_max_iou > pos_iou_thresh)[0]
+        # handle tied cases robustly
+        anchor_positive_index1 = np.nonzero(iou == anchor_max_iou[anchor_positive_index1])[0]
+        anchor_positive_index2 = np.nonzero(anchor_max_iou >= pos_iou_thresh)[0]
         anchor_positive_index = np.unique(
             np.append(anchor_positive_index1, anchor_positive_index2))
         anchor_negative_index = np.nonzero(anchor_max_iou < neg_iou_thresh)[0]
@@ -276,3 +270,57 @@ def get_anchor_labels(anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh,
 
     return anchor_positive_index, anchor_negative_index, \
         anchor_positive_class_labels, anchor_positive_loc_labels
+
+
+def get_display_pred_boxes(output, resized_shapes, orig_shapes, id_to_name_map, batch_idx=0, top3=False):
+    pred_boxes, batch_indices = get_boxes_from_output(output, resized_shapes, orig_shapes)
+    box_index = next(idx for idx, b in enumerate(batch_indices) if b == batch_idx)
+    batch_pred_boxes = pred_boxes[box_index]
+
+    rect_list = [(rect, conf, cls) for cls in batch_pred_boxes
+                 for rect, conf in zip(batch_pred_boxes[cls]['rects'], batch_pred_boxes[cls]['confs'])]
+    rect_list = sorted(rect_list, key=lambda x: -x[1])
+
+    output_rects = []
+    output_strs = []
+    for rect_rank, (rect, conf, cls) in enumerate(rect_list):
+        if conf >= 0.7 or (rect_rank < 3 and top3):
+            output_rects.append(rect.astype(np.int32).tolist())
+            output_strs.append('{}({:.4f})'.format(id_to_name_map[cls], conf))
+
+    return output_rects, output_strs
+
+
+def get_display_gt_boxes(gt_boxes, gt_class_labels, resized_shapes, orig_shapes, id_to_name_map, gt_count=None,
+                         batch_idx=None):
+    # if batch_idx is None we assume this is sample directly from dataset so create artificial batch of size 0
+    if batch_idx is None:
+        gt_boxes = [gt_boxes]
+        gt_class_labels = [gt_class_labels]
+        orig_shapes = [orig_shapes]
+        resized_shapes = [resized_shapes]
+        batch_idx = 0
+        gt_count = None if gt_count is None else [gt_count]
+
+    if gt_count is None:
+        gt_count = gt_boxes[batch_idx].shape[0]
+    else:
+        gt_count = gt_count[batch_idx]
+
+    # orig_shapes and resized_shapes provided as (height, width)
+    scale_x = orig_shapes[batch_idx][1] / resized_shapes[batch_idx][1]
+    scale_y = orig_shapes[batch_idx][0] / resized_shapes[batch_idx][0]
+    rect_list_gt = gt_boxes[batch_idx][:gt_count]
+    if torch.is_tensor(rect_list_gt):
+        rect_list_gt = rect_list_gt.cpu().numpy()
+    rect_list_gt = rect_list_gt.copy()
+    rect_list_gt[:, ::2] *= scale_x
+    rect_list_gt[:, 1::2] *= scale_y
+    class_labels = gt_class_labels[batch_idx][:gt_count]
+    if torch.is_tensor(class_labels):
+        class_labels = class_labels.cpu().numpy()
+    text_list_gt = [id_to_name_map[lid] for lid in class_labels]
+
+    rect_list_gt = rect_list_gt.astype(np.int32).tolist()
+
+    return rect_list_gt, text_list_gt

@@ -8,6 +8,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+import torch.utils.data
 
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets
@@ -16,16 +17,17 @@ import torchvision.transforms.functional as tvtf
 
 from data.coco import CocoDetectionWithImgId, create_coco_targets
 from data.voc import create_voc_targets
-from data.general import faster_rcnn_collate_fn, ResizeAndPad
+from data.general import faster_rcnn_collate_fn, DynamicResize, PadToShape
 
-from utils.data_mappings import coco_num_obj_classes, coco_id_to_name, voc_num_obj_classes, voc_id_to_name
-from utils.box_utils import define_anchor_boxes, get_bboxes_from_output
+from utils.data_mappings import coco_num_obj_classes, voc_num_obj_classes, coco_id_to_name, voc_id_to_name
+from utils.box_utils import define_anchor_boxes, get_boxes_from_output, get_display_gt_boxes, get_display_pred_boxes
 from utils.image_utils import draw_detections
 from utils.metrics import compute_map, compute_map_coco, save_coco_style, AverageMeter
 
 from models.faster_rcnn import FasterRCNN
 from models.criterion import FasterRCNNCriterion
 
+from third_party.eval_tool import compute_map_voc
 
 parser = argparse.ArgumentParser('Training code for simple Faster-RCNN implementation')
 parser.add_argument('dataset', default='voc', type=str, choices={'voc', 'coco'},
@@ -39,7 +41,7 @@ parser.add_argument('--voc-root', '-vr', default='../pascal_voc', type=str,
                     help='Root directory of Pascal VOC dataset')
 parser.add_argument('--train-batch-size', '-b', default=1, type=int,
                     help='Training batch size')
-parser.add_argument('--test-batch-size', '-tb', default=16, type=int,
+parser.add_argument('--test-batch-size', '-tb', default=8, type=int,
                     help='Test batch size')
 parser.add_argument('--num-workers', '-j', default=8, type=int,
                     help='Number of workers')
@@ -47,7 +49,7 @@ parser.add_argument('--learning-rate', '-lr', default=0.001, type=float,
                     help='Initial learning rate')
 parser.add_argument('--momentum', '-m', default=0.9, type=float,
                     help='Momentum for SGD')
-parser.add_argument('--weight-decay', '-wd', default=1e-5, type=float,
+parser.add_argument('--weight-decay', '-wd', default=5e-4, type=float,
                     help='Weight decay parameter for SGD')
 parser.add_argument('--num-epochs', '-ne', default=15, type=int,
                     help='Number of epochs')
@@ -74,27 +76,29 @@ parser.add_argument('--quick-validate', '-qv', action='store_true',
 args = parser.parse_args()
 
 
-def load_datasets(sub_sample, resize_shape):
-    anchor_boxes = define_anchor_boxes(sub_sample=sub_sample, height=resize_shape[0], width=resize_shape[1])
-
-    # TODO Improve the transforms with better data augmentation
+def load_datasets(anchor_boxes, min_shape=(600, 600), max_shape=(1000, 1000)):
+    # random flipping is done in dataset create_<dataset>_targets
+    mean_val = [0.485, 0.456, 0.406]
+    std_val = [0.229, 0.224, 0.225]
     train_transform = tvt.Compose([
-        tvt.ColorJitter(0.1, 0.1, 0.1, 0.1),
-        ResizeAndPad(resize_shape),
+        DynamicResize(min_shape, max_shape),
         tvt.ToTensor(),
-        tvt.Normalize([0.5] * 3, [0.5] * 3)
+        tvt.Normalize(mean_val, std_val),
+        PadToShape(max_shape)
     ])
     val_transform = tvt.Compose([
-        ResizeAndPad(resize_shape),
+        DynamicResize(min_shape, max_shape),
         tvt.ToTensor(),
-        tvt.Normalize([0.5] * 3, [0.5] * 3)
+        tvt.Normalize(mean_val, std_val),
+        PadToShape(max_shape)
     ])
 
     if args.dataset == 'coco':
         print('Loading MSCOCO Detection dataset')
-        base_transforms = partial(create_coco_targets, resize_shape=resize_shape, anchor_boxes=anchor_boxes)
+        base_transforms = partial(create_coco_targets, anchor_boxes=anchor_boxes, min_shape=min_shape,
+                                  max_shape=max_shape)
 
-        train_transforms = partial(base_transforms, data_transform=train_transform)
+        train_transforms = partial(base_transforms, data_transform=train_transform, random_flip=True)
         val_transforms = partial(base_transforms, data_transform=val_transform)
 
         train_dataset = CocoDetectionWithImgId(
@@ -111,31 +115,32 @@ def load_datasets(sub_sample, resize_shape):
 
         num_classes = coco_num_obj_classes
     elif args.dataset == 'voc':
-        print('Loading Pascal VOC 2012 Detection dataset')
-        base_transforms = partial(create_voc_targets, resize_shape=resize_shape, anchor_boxes=anchor_boxes)
+        print('Loading Pascal VOC 2007 Detection dataset')
+        base_transforms = partial(create_voc_targets, anchor_boxes=anchor_boxes, min_shape=min_shape,
+                                  max_shape=max_shape)
 
-        train_transforms = partial(base_transforms, data_transform=train_transform)
-        val_transforms = partial(base_transforms, data_transform=val_transform)
+        train_transforms = partial(base_transforms, data_transform=train_transform, random_flip=True,
+                                   use_difficult=False)
+        val_transforms = partial(base_transforms, data_transform=val_transform, use_difficult=True)
 
-        download = not os.path.exists(os.path.join(args.voc_root, 'VOCdevkit/VOC2012'))
-        train_dataset = datasets.VOCDetection(args.voc_root, year='2012', download=download,
-                                              image_set='train',
-                                              transforms=train_transforms)
-        val_dataset = datasets.VOCDetection(args.voc_root, year='2012', download=download,
-                                            image_set='val',
+        download = not os.path.exists(os.path.join(args.voc_root, 'VOCdevkit/VOC2007'))
+        train_dataset = torch.utils.data.ConcatDataset([
+            datasets.VOCDetection(args.voc_root, year='2007', download=download,
+                                  image_set='train',
+                                  transforms=train_transforms),
+            datasets.VOCDetection(args.voc_root, year='2007', download=download,
+                                  image_set='val',
+                                  transforms=train_transforms)])
+
+        val_dataset = datasets.VOCDetection(args.voc_root, year='2007', download=download,
+                                            image_set='test',
                                             transforms=val_transforms)
 
-        bad_voc_train_indices = {2609}
-        train_dataset = torch.utils.data.Subset(
-            train_dataset, [i for i in range(len(train_dataset)) if i not in bad_voc_train_indices])
-        bad_voc_val_indices = {478}
-        val_dataset = torch.utils.data.Subset(
-            val_dataset, [i for i in range(len(val_dataset)) if i not in bad_voc_val_indices])
         num_classes = voc_num_obj_classes
     else:
         raise ValueError
 
-    train_sampler = torch.utils.data.RandomSampler(train_dataset)  # equivalent to shuffle=True
+    train_sampler = torch.utils.data.RandomSampler(train_dataset)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -157,14 +162,14 @@ def load_datasets(sub_sample, resize_shape):
         pin_memory=True
     )
 
-    return train_loader, val_loader, anchor_boxes, num_classes
+    return train_loader, val_loader, num_classes
 
 
 def load_checkpoint(model, criterion, optimizer, lr_scheduler):
     print('====================================================')
     print('loading checkpoint', args.resume)
     checkpoint = torch.load(args.resume)
-    model.module.load_state_dict(checkpoint['model.state_dict'])
+    model.load_state_dict(checkpoint['model.state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer.state_dict'])
     criterion.load_state_dict(checkpoint['criterion.state_dict'])
     lr_scheduler.load_state_dict(checkpoint['lr_scheduler.state_dict'])
@@ -182,7 +187,7 @@ def save_checkpoint(model, criterion, optimizer, lr_scheduler, epoch, best_map, 
     checkpoint_name = args.checkpoint_format.format(epoch=epoch, best_map=best_map)
     print('Saving checkpoint to', checkpoint_name)
     checkpoint = {
-        'model.state_dict': model.module.state_dict(),
+        'model.state_dict': model.state_dict(),
         'optimizer.state_dict': optimizer.state_dict(),
         'criterion.state_dict': criterion.state_dict(),
         'lr_scheduler.state_dict': lr_scheduler.state_dict(),
@@ -203,7 +208,7 @@ def save_checkpoint(model, criterion, optimizer, lr_scheduler, epoch, best_map, 
         print('Finished copying to', best_checkpoint_name)
 
 
-def get_optimizer(model, lr=0.01, weight_decay=1e-5, use_adam=True):
+def get_optimizer(model, lr=0.01, weight_decay=5e-4, use_adam=True):
     params = []
     for key, value in dict(model.named_parameters()).items():
         if value.requires_grad:
@@ -214,44 +219,7 @@ def get_optimizer(model, lr=0.01, weight_decay=1e-5, use_adam=True):
     if use_adam:
         return torch.optim.Adam(params)
     else:
-        return torch.optim.SGD(params, momentum=0.9)
-
-
-def get_display_pred_boxes(output, resized_shapes, orig_shapes, batch_idx=0, top3=False):
-    pred_boxes, batch_indices = get_bboxes_from_output(output, resized_shapes, orig_shapes)
-    box_index = next(idx for idx, b in enumerate(batch_indices) if b == batch_idx)
-    batch_pred_boxes = pred_boxes[box_index]
-
-    rect_list = [(rect, conf, cls) for cls in batch_pred_boxes
-                 for rect, conf in zip(batch_pred_boxes[cls]['rects'], batch_pred_boxes[cls]['confs'])]
-    rect_list = sorted(rect_list, key=lambda x: -x[1])
-
-    output_rects = []
-    output_strs = []
-    for rect_rank, (rect, conf, cls) in enumerate(rect_list):
-        if conf >= 0.7 or (rect_rank < 3 and top3):
-            output_rects.append(rect.astype(np.int32).tolist())
-            output_strs.append('{}({:.4f})'.format(
-                coco_id_to_name[cls] if args.dataset == 'coco' else voc_id_to_name[cls],
-                conf))
-
-    return output_rects, output_strs
-
-
-def get_display_gt_boxes(gt_boxes, gt_class_labels, gt_count, resized_shapes, orig_shapes, batch_idx=0):
-    scale_x = resized_shapes[batch_idx][0] / orig_shapes[batch_idx][0]
-    scale_y = resized_shapes[batch_idx][1] / orig_shapes[batch_idx][1]
-    scale = min(scale_x, scale_y)
-
-    rect_list_gt = gt_boxes[batch_idx][:gt_count[batch_idx]].cpu().numpy()
-    rect_list_gt /= scale
-    text_list_gt = [coco_id_to_name[lid.item()] if args.dataset == 'coco'
-                    else voc_id_to_name[lid.item()]
-                    for lid in gt_class_labels[batch_idx][:gt_count[batch_idx]]]
-
-    rect_list_gt = rect_list_gt.astype(np.int32).tolist()
-
-    return rect_list_gt, text_list_gt
+        return torch.optim.SGD(params, lr=lr, momentum=0.9)
 
 
 def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_loader):
@@ -262,9 +230,12 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
     rpn_loc_loss_avg = AverageMeter(0.998)
     roi_cls_loss_avg = AverageMeter(0.998)
     roi_loc_loss_avg = AverageMeter(0.998)
+
+    id_to_name_map = coco_id_to_name if args.dataset == 'coco' else voc_id_to_name
     with tqdm(total=len(train_loader), ncols=0, desc='Training Epoch {}'.format(epoch)) as pbar:
         for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels,
-                               gt_count, initial_batch_idx, gt_image_ids, ignore, imgs)) in enumerate(train_loader):
+                               gt_count, initial_batch_idx, gt_image_ids, gt_difficult, ignore,
+                               valid_shapes, imgs)) in enumerate(train_loader):
             data = data.cuda()
             anchor_obj = anchor_obj.cuda()
             anchor_loc = anchor_loc.cuda()
@@ -299,24 +270,25 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
                     output = model(test_img, torch.tensor((0,)).to(device=test_img.device))
                     model.train()
 
-                resized_shapes = {batch_idx: (d.shape[-1], d.shape[-2]) for batch_idx, d in enumerate(data)}
-                orig_shapes = {batch_idx: img.size for batch_idx, img in enumerate(imgs)}
+                orig_shapes = {batch_idx: (img.size[1], img.size[0]) for batch_idx, img in enumerate(imgs)}
 
-                rect_list, text_list = get_display_pred_boxes(output, resized_shapes, orig_shapes, top3=True)
+                rect_list, text_list = get_display_pred_boxes(output, valid_shapes, orig_shapes, id_to_name_map,
+                                                              top3=True)
                 pred_img = draw_detections(img, rect_list, text_list)
 
-                rect_list_gt, text_list_gt = get_display_gt_boxes(gt_boxes, gt_class_labels, gt_count, resized_shapes,
-                                                                  orig_shapes)
+                rect_list_gt, text_list_gt = get_display_gt_boxes(gt_boxes, gt_class_labels, valid_shapes, orig_shapes,
+                                                                  id_to_name_map, gt_count=gt_count, batch_idx=0)
                 gt_img = draw_detections(img, rect_list_gt, text_list_gt)
 
-                writer.add_images('Train {}/example_gt_pred'.format(epoch),
-                                  torch.stack((tvtf.to_tensor(gt_img), tvtf.to_tensor(pred_img)), dim=0))
+                writer.add_images('Train Epoch {}/example_gt_pred'.format(epoch),
+                                  torch.stack((tvtf.to_tensor(gt_img), tvtf.to_tensor(pred_img)), dim=0),
+                                  global_step=batch_num // args.print_freq)
 
-                writer.add_scalar('Loss {}/train loss'.format(epoch), loss_avg.average, batch_num)
-                writer.add_scalar('Loss {}/train rpn_obj_loss'.format(epoch), rpn_obj_loss_avg.average, batch_num)
-                writer.add_scalar('Loss {}/train rpn_loc_loss'.format(epoch), rpn_loc_loss_avg.average, batch_num)
-                writer.add_scalar('Loss {}/train roi_cls_loss'.format(epoch), roi_cls_loss_avg.average, batch_num)
-                writer.add_scalar('Loss {}/train roi_loc_loss'.format(epoch), roi_loc_loss_avg.average, batch_num)
+                writer.add_scalar('Loss/train loss'.format(epoch), loss_avg.average, batch_num)
+                writer.add_scalar('Loss/train rpn_obj_loss'.format(epoch), rpn_obj_loss_avg.average, batch_num)
+                writer.add_scalar('Loss/train rpn_loc_loss'.format(epoch), rpn_loc_loss_avg.average, batch_num)
+                writer.add_scalar('Loss/train roi_cls_loss'.format(epoch), roi_cls_loss_avg.average, batch_num)
+                writer.add_scalar('Loss/train roi_loc_loss'.format(epoch), roi_loc_loss_avg.average, batch_num)
 
             pbar.update()
 
@@ -327,25 +299,25 @@ def validate(writer, model, val_loader, save_pred_filename='', save_gt_filename=
         preds = []
         gt = []
         image_ids = []
-        for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels,
-                               gt_count, data_batch_idx, gt_image_ids, ignore, imgs)) in \
+        for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels, gt_count, data_batch_idx,
+                               gt_image_ids, difficult, ignore, valid_shapes, imgs)) in \
                 tqdm(enumerate(val_loader), total=len(val_loader), ncols=0, desc='Validation'):
             data = data.cuda()
             data_batch_idx = data_batch_idx.cuda()
             output = model(data, data_batch_idx)
 
             # get predicted boxes
-            resized_shapes = {batch_idx: (d.shape[-1], d.shape[-2]) for batch_idx, d in enumerate(data)}
-            orig_shapes = {batch_idx: img.size for batch_idx, img in enumerate(imgs)}
-            batch_preds, pred_batch_indices = get_bboxes_from_output(output, resized_shapes, orig_shapes)
+            orig_shapes = {batch_idx: (img.size[1], img.size[0]) for batch_idx, img in enumerate(imgs)}
+            batch_preds, pred_batch_indices = get_boxes_from_output(output, valid_shapes, orig_shapes)
 
             batch_image_ids = []
             batch_gt = []
             for batch_idx in pred_batch_indices:
-                scale_x = orig_shapes[batch_idx][0] / float(resized_shapes[batch_idx][0])
-                scale_y = orig_shapes[batch_idx][1] / float(resized_shapes[batch_idx][1])
+                scale_x = orig_shapes[batch_idx][1] / float(valid_shapes[batch_idx][1])
+                scale_y = orig_shapes[batch_idx][0] / float(valid_shapes[batch_idx][0])
                 batch_gt.append(defaultdict(lambda: {'rects': np.zeros((0, 4), dtype=np.float32),
-                                                     'ignore': np.zeros((0,), dtype=np.bool)}))
+                                                     'ignore': np.zeros((0,), dtype=np.bool),
+                                                     'difficult': np.zeros((0,), dtype=np.bool)}))
                 batch_gt_labels = gt_class_labels[batch_idx][:gt_count[batch_idx]].cpu().numpy().reshape(-1)
                 for label in np.unique(batch_gt_labels):
                     label_idx = np.nonzero(batch_gt_labels == label)[0]
@@ -353,6 +325,7 @@ def validate(writer, model, val_loader, save_pred_filename='', save_gt_filename=
                     batch_gt[-1][label]['rects'][:, ::2] *= scale_x
                     batch_gt[-1][label]['rects'][:, 1::2] *= scale_y
                     batch_gt[-1][label]['ignore'] = ignore[batch_idx][label_idx]
+                    batch_gt[-1][label]['difficult'] = difficult[batch_idx][label_idx]
                 batch_image_ids.append(gt_image_ids[batch_idx])
 
             # append to output list
@@ -377,41 +350,47 @@ def validate(writer, model, val_loader, save_pred_filename='', save_gt_filename=
         coco_gt_file = os.path.join(args.coco_root, 'annotations/instances_val2017.json')
         validate_map = compute_map_coco(coco_gt_file, preds, image_ids)
     else:
-        validate_map = compute_map(gt, preds)
+        # TODO explore small difference between my implementation (compute_map) and third party (compute_map_voc)
+        # validate_map = compute_map(gt, preds)
+        validate_map = compute_map_voc(gt, preds, use_07_metric=True)
+
     print('mAP score @ 0.5 IoU: {:.5}'.format(validate_map))
     return validate_map
 
 
-def eval_examples(writer, model, val_loader, num_shown_examples=10):
+def eval_examples(writer, model, val_loader, epoch, num_shown_examples=10):
+    id_to_name_map = coco_id_to_name if args.dataset == 'coco' else voc_id_to_name
+
     model.eval()
     with torch.no_grad():
         total = min(int(num_shown_examples // args.test_batch_size), len(val_loader))
         with tqdm(total=total, ncols=0, desc='Val Examples') as pbar:
             shown_examples = 0
-            for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels,
-                                   gt_count, data_batch_idx, gt_image_ids, ignore, imgs)) in enumerate(val_loader):
+            for batch_num, (data, (anchor_obj, anchor_loc, gt_boxes, gt_class_labels, gt_count, data_batch_idx,
+                                   gt_image_ids, gt_difficult, ignore, valid_shapes, imgs)) in enumerate(val_loader):
                 data = data.cuda()
                 data_batch_idx = data_batch_idx.cuda()
                 output = model(data, data_batch_idx)
                 batch_size = data.shape[0]
 
-                resized_shapes = {batch_idx: (d.shape[-1], d.shape[-2]) for batch_idx, d in enumerate(data)}
-                orig_shapes = {batch_idx: img.size for batch_idx, img in enumerate(imgs)}
+                orig_shapes = {batch_idx: (img.size[1], img.size[0]) for batch_idx, img in enumerate(imgs)}
                 for batch_idx in range(batch_size):
                     if shown_examples >= num_shown_examples:
                         pbar.update()
                         return
                     img = imgs[batch_idx]
 
-                    rect_list_pred, text_list_pred = get_display_pred_boxes(output, resized_shapes, orig_shapes, batch_idx)
+                    rect_list_pred, text_list_pred = get_display_pred_boxes(output, valid_shapes, orig_shapes,
+                                                                            id_to_name_map, batch_idx)
                     pred_img = draw_detections(img, rect_list_pred, text_list_pred)
 
-                    rect_list_gt, text_list_gt = get_display_gt_boxes(gt_boxes, gt_class_labels, gt_count, resized_shapes,
-                                                                      orig_shapes, batch_idx)
+                    rect_list_gt, text_list_gt = get_display_gt_boxes(gt_boxes, gt_class_labels, valid_shapes,
+                                                                      orig_shapes, id_to_name_map, gt_count, batch_idx)
                     gt_img = draw_detections(img, rect_list_gt, text_list_gt)
 
                     writer.add_images('Validate/example_{}_gt_pred'.format(shown_examples),
-                                      torch.stack((tvtf.to_tensor(gt_img), tvtf.to_tensor(pred_img)), dim=0))
+                                      torch.stack((tvtf.to_tensor(gt_img), tvtf.to_tensor(pred_img)), dim=0),
+                                      global_step=epoch)
 
                     shown_examples += 1
 
@@ -419,16 +398,24 @@ def eval_examples(writer, model, val_loader, num_shown_examples=10):
 
 
 def main(writer):
-    resize_width = 800
-    resize_height = 800
+    min_height = 600
+    min_width = 600
+    max_height = 1000
+    max_width = 1000
     sub_sample = 16
 
+    # define the anchor boxes
+    anchor_boxes = define_anchor_boxes(sub_sample, max_height, max_width)
+
     # define datasets
-    train_loader, val_loader, anchor_boxes, num_classes = load_datasets(sub_sample, (resize_height, resize_width))
+    train_loader, val_loader, num_classes = load_datasets(anchor_boxes, (min_height, min_width),
+                                                          (max_height, max_width))
 
     # define model
-    model = FasterRCNN(anchor_boxes, num_classes=num_classes, return_rpn_output=True, arch=args.arch)
-    model = torch.nn.DataParallel(model).cuda()
+    model = FasterRCNN(anchor_boxes, num_classes=num_classes, return_rpn_output=True, arch=args.arch,
+                       img_shape=(max_height, max_width))
+    # model = torch.nn.DataParallel(model).cuda()
+    model.cuda()
 
     # define optimizer
     optimizer = get_optimizer(model, args.learning_rate, args.weight_decay, args.use_adam)
@@ -448,7 +435,7 @@ def main(writer):
 
     # validate only if indicated
     if args.validate:
-        eval_examples(writer, model, val_loader)
+        eval_examples(writer, model, val_loader, start_epoch)
         if not args.quick_validate:
             validate_map = validate(writer, model, val_loader)
         return
@@ -458,7 +445,10 @@ def main(writer):
         train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_loader)
         lr_scheduler.step()
 
-        eval_examples(writer, model, val_loader)
+        # save a checkpoint now, will overwrite with real one after validation (useful if validation crashes)
+        save_checkpoint(model, criterion, optimizer, lr_scheduler, epoch, -1.0, False)
+
+        eval_examples(writer, model, val_loader, epoch)
         if not args.quick_validate:
             validate_map = validate(writer, model, val_loader)
         else:

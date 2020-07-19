@@ -89,11 +89,9 @@ class HeadResNet(ResNetWrapper):
         pred_indices_and_boxes = np.concatenate((pred_batch_idx.reshape(-1, 1), pred_boxes), axis=1)
         pred_indices_and_boxes = torch.from_numpy(pred_indices_and_boxes).to(x)
 
-        # TODO write my own roi_align or roi_pool layer
-        # regions = ops.roi_pool(x, pred_indices_and_boxes.transpose(0, 2, 1, 4, 3), self.roi_align_size, self.spatial_scale)
-        # regions = ops.roi_align(x, pred_indices_and_boxes.transpose(0, 2, 1, 4, 3), self.roi_align_size, self.spatial_scale)
-        regions = ops.roi_pool(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
+        # TODO should I use roi_align?
         # regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
+        regions = ops.roi_pool(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
         y = self.avgpool(self.layer4(regions))
         y = torch.flatten(y, start_dim=1)
 
@@ -108,6 +106,7 @@ class FeatureNetVGG16(nn.Module):
         super().__init__()
         model = vgg16(pretrained=True)
         features = list(model.features)[:30]
+        # freeze top4 conv
         for layer in features[:10]:
             for p in layer.parameters():
                 p.requires_grad = False
@@ -131,7 +130,9 @@ class HeadVGG16(nn.Module):
         model = vgg16(pretrained=True)
         classifier = model.classifier
         classifier = list(classifier)
+        # remove final fc layer
         del classifier[6]
+        # remove drop-out
         del classifier[5]
         del classifier[2]
         self.classifier = nn.Sequential(*classifier)
@@ -139,7 +140,7 @@ class HeadVGG16(nn.Module):
         self.fc_loc = nn.Linear(4096, num_classes * 4)
         self.fc_cls = nn.Linear(4096, num_classes)
 
-        self.fc_loc.weight.data.normal_(0, 0.01)
+        self.fc_loc.weight.data.normal_(0, 0.001)
         self.fc_loc.bias.data.zero_()
         self.fc_cls.weight.data.normal_(0, 0.01)
         self.fc_cls.bias.data.zero_()
@@ -147,15 +148,16 @@ class HeadVGG16(nn.Module):
     def forward(self, x, pred_boxes, pred_batch_idx):
         num_regions = len(pred_batch_idx)
 
-        pred_indices_and_boxes = np.concatenate((pred_batch_idx.reshape(-1, 1), pred_boxes), axis=1)
+        pred_indices_and_boxes = np.concatenate((pred_batch_idx.reshape(-1, 1).astype(np.float32), pred_boxes), axis=1)
         pred_indices_and_boxes = torch.from_numpy(pred_indices_and_boxes).to(x)
 
-        # TODO write my own roi_align or roi_pool layer
-        regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
+        # TODO should I use roi_align?
+        # regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
+        regions = ops.roi_pool(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
         y = self.classifier(torch.flatten(regions, start_dim=1))
 
-        pred_roi_cls = self.fc_cls(y)
         pred_roi_loc = self.fc_loc(y).view(num_regions, -1, 4)
+        pred_roi_cls = self.fc_cls(y)
 
         return pred_roi_cls, pred_roi_loc
 
@@ -166,15 +168,15 @@ class RegionProposalNetwork(nn.Module):
         self.num_anchors = num_anchors
 
         self.conv1 = nn.Conv2d(in_channels, mid_channels, 3, 1, 1)
-        self.conv_loc = nn.Conv2d(mid_channels, num_anchors * 4, 1, 1, 0)
         self.conv_obj = nn.Conv2d(mid_channels, num_anchors * 2, 1, 1, 0)
+        self.conv_loc = nn.Conv2d(mid_channels, num_anchors * 4, 1, 1, 0)
 
         self.conv1.weight.data.normal_(0, 0.01)
         self.conv1.bias.data.zero_()
-        self.conv_loc.weight.data.normal_(0, 0.01)
-        self.conv_loc.bias.data.zero_()
         self.conv_obj.weight.data.normal_(0, 0.01)
         self.conv_obj.bias.data.zero_()
+        self.conv_loc.weight.data.normal_(0, 0.01)
+        self.conv_loc.bias.data.zero_()
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
@@ -184,12 +186,11 @@ class RegionProposalNetwork(nn.Module):
 
 
 class PreprocessHead(nn.Module):
-    def __init__(self, anchor_boxes):
+    def __init__(self, anchor_boxes, img_shape=(1000, 1000)):
         super().__init__()
         self.anchor_boxes = torch.from_numpy(anchor_boxes)
 
-        self.img_width = 800
-        self.img_height = 800
+        self.img_height, self.img_width = img_shape
         self.n_train_pre_nms = 12000
         self.n_train_post_nms = 2000
         self.n_test_pre_nms = 6000
@@ -200,13 +201,13 @@ class PreprocessHead(nn.Module):
     def __call__(self, pred_loc, pred_obj):
         batch_size = pred_loc.shape[0]
 
-        pred_loc = pred_loc.detach()
-        pred_obj = pred_obj.detach()
         anchor_boxes = self.anchor_boxes.to(device=pred_loc.device)
 
+        pred_loc = pred_loc.detach()
+        pred_obj = pred_obj.detach()
         pred_obj_sm = torch.softmax(pred_obj, dim=2)[:, :, 1]
 
-        pred_boxes = get_boxes_from_loc_batch(anchor_boxes, pred_loc, self.img_width, self.img_height)
+        pred_boxes = get_boxes_from_loc_batch(anchor_boxes, pred_loc, self.img_height, self.img_width)
 
         pred_boxes_post_nms = []
         for batch_idx in range(batch_size):
@@ -236,55 +237,6 @@ class PreprocessHead(nn.Module):
         pred_boxes = pred_boxes.cpu().numpy()
 
         return pred_boxes, pred_batch_idx
-
-        # --- CPU version
-        # pred_obj_sm = torch.softmax(pred_obj, dim=2)
-        #
-        # torch.cuda.synchronize()
-        # t0 = time.time()
-        # pred_loc_np = pred_loc.cpu().detach().numpy()
-        # pred_obj_np = pred_obj_sm[:, :, 1].cpu().detach().numpy()
-        # torch.cuda.synchronize()
-        # print('convert to numpy', time.time() - t0)
-        #
-        # t0 = time.time()
-        # pred_boxes = get_boxes_from_loc(self.anchor_boxes, pred_loc_np, self.img_width, self.img_height)
-        # torch.cuda.synchronize()
-        # print('get boxes from loc', time.time() - t0)
-        #
-        # t0 = time.time()
-        # # not sure this can be done without a loop since each batch index may have different number of regions
-        # pred_boxes_post_nms = []
-        # for batch_idx in range(batch_size):
-        #     batch_pred_boxes = pred_boxes[batch_idx, :, :]
-        #     batch_pred_obj = pred_obj_np[batch_idx, :]
-        #
-        #     valid_boxes = (batch_pred_boxes[:, 2:] - batch_pred_boxes[:, :2] >= self.min_size).all(axis=1)
-        #     batch_pred_boxes = batch_pred_boxes[valid_boxes, :]
-        #     batch_pred_obj = batch_pred_obj[valid_boxes]
-        #
-        #     pred_indices = np.argsort(batch_pred_obj)[::-1]
-        #     if self.training:
-        #         pred_indices = pred_indices[:self.n_train_pre_nms]
-        #         n_post_nms = self.n_train_post_nms
-        #     else:
-        #         pred_indices = pred_indices[:self.n_test_pre_nms]
-        #         n_post_nms = self.n_test_post_nms
-        #     batch_pred_boxes = batch_pred_boxes[pred_indices, :]
-        #     batch_pred_obj = batch_pred_obj[pred_indices]
-        #
-        #     t0 = time.time()
-        #     nms = apply_nms(batch_pred_boxes, batch_pred_obj, self.nms_threshold, n_post_nms)
-        #     print('nms', time.time() - t0)
-        #
-        #     pred_boxes_post_nms.append(nms)
-        #
-        # pred_batch_idx = np.repeat(np.arange(batch_size), [b.shape[0] for b in pred_boxes_post_nms])
-        # pred_boxes = np.concatenate(pred_boxes_post_nms, axis=0)
-        # torch.cuda.synchronize()
-        # print('for loop', time.time() - t0)
-        #
-        # return pred_boxes, pred_batch_idx
 
 
 class TrainingProposalSelector:
@@ -371,14 +323,15 @@ class TrainingProposalSelector:
 
 
 class FasterRCNN(nn.Module):
-    def __init__(self, anchor_boxes, num_anchors=9, num_classes=92, return_rpn_output=False, arch='vgg16'):
+    def __init__(self, anchor_boxes, num_anchors=9, num_classes=92, return_rpn_output=False, arch='vgg16',
+                 img_shape=(1000, 1000)):
         super().__init__()
         self.return_rpn_output = return_rpn_output
 
         self.feature_net = FeatureNetVGG16() if arch == 'vgg16' else FeatureNetResNet(arch)
         self.region_proposal_network = RegionProposalNetwork(num_anchors,
                                                              self.feature_net.get_out_channels())
-        self.preprocess_head = PreprocessHead(anchor_boxes)
+        self.preprocess_head = PreprocessHead(anchor_boxes, img_shape=img_shape)
         self.head = HeadVGG16(num_classes) if arch == 'vgg16' else HeadResNet(num_classes, arch)
         self.training_proposal_selector = TrainingProposalSelector()
 
@@ -386,6 +339,7 @@ class FasterRCNN(nn.Module):
         if self.training:
             assert gt_boxes is not None and gt_count is not None and gt_class_labels is not None
 
+        input_shape = x.shape[-2:]
         x = self.feature_net(x)
 
         pred_loc, pred_obj = self.region_proposal_network(x)

@@ -21,7 +21,7 @@ class CocoDetectionWithImgId(datasets.CocoDetection):
         return img, target
 
 
-def create_coco_targets(data, labels, image_id, data_transform, resize_shape, anchor_boxes,
+def create_coco_targets(data, labels, image_id, data_transform, resize_shape, anchor_boxes, valid_anchors,
                         pos_iou_thresh=0.7, neg_iou_thresh=0.3, pos_ratio=0.5, num_samples=256,
                         mark_max_gt_anchors=True):
     orig_width, orig_height = data.size
@@ -30,20 +30,6 @@ def create_coco_targets(data, labels, image_id, data_transform, resize_shape, an
     orig_img = data
 
     num_anchors = anchor_boxes.shape[0]
-
-    if float(new_width) / orig_width < float(new_height) / orig_height:
-        scale = float(new_width) / orig_width
-    else:
-        scale = float(new_height) / orig_height
-
-    valid_width = int(round(orig_width * scale))
-    valid_height = int(round(orig_height * scale))
-
-    valid_anchors = np.nonzero(
-        np.concatenate((anchor_boxes[:, :2] >= 0,
-                        anchor_boxes[:, 2:3] < valid_width,
-                        anchor_boxes[:, 3:4] < valid_height),
-                       axis=1).all(axis=1))[0]
 
     if len(labels) > 0:
         ignore = np.array([('ignore' in label and label['ignore']) or ('iscrowd' in label and label['iscrowd'])
@@ -55,7 +41,10 @@ def create_coco_targets(data, labels, image_id, data_transform, resize_shape, an
 
         gt_boxes[:, 2:] += gt_boxes[:, 0:2]
 
-        gt_boxes *= scale
+        scale_x = float(new_width) / orig_width
+        scale_y = float(new_height) / orig_height
+        gt_boxes[:, ::2] *= scale_x
+        gt_boxes[:, 1::2] *= scale_y
     else:
         ignore = np.zeros((0,), dtype=np.bool)
         gt_class_labels = np.zeros((0,), dtype=np.int32)
