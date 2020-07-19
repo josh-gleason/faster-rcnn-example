@@ -1,8 +1,8 @@
 import numpy as np
-import time
 import torch
 from collections import defaultdict
 from torchvision import ops
+from utils.data_mappings import coco_id_to_name, voc_id_to_name
 
 
 def compute_iou(boxes1, boxes2):
@@ -56,7 +56,7 @@ def get_loc_labels(anchor_boxes, gt_boxes, loc_mean=None, loc_std=None):
     return loc
 
 
-def get_boxes_from_loc_batch(anchor_boxes, loc, img_width, img_height, loc_mean=None, loc_std=None):
+def get_boxes_from_loc_batch(anchor_boxes, loc, img_height, img_width, loc_mean=None, loc_std=None):
     """ Convert batch of loc predictions (as torch.tensors) to bounding boxes.
 
     Args:
@@ -160,7 +160,7 @@ def get_boxes_from_loc(anchor_boxes, loc, img_width, img_height, loc_mean=None, 
     return boxes
 
 
-def define_anchor_boxes(sub_sample, width, height):
+def define_anchor_boxes(sub_sample, height, width):
     feature_map_w, feature_map_h = (width // sub_sample), (height // sub_sample)
 
     # using np.array
@@ -270,3 +270,57 @@ def get_anchor_labels(anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh,
 
     return anchor_positive_index, anchor_negative_index, \
         anchor_positive_class_labels, anchor_positive_loc_labels
+
+
+def get_display_pred_boxes(output, resized_shapes, orig_shapes, id_to_name_map, batch_idx=0, top3=False):
+    pred_boxes, batch_indices = get_boxes_from_output(output, resized_shapes, orig_shapes)
+    box_index = next(idx for idx, b in enumerate(batch_indices) if b == batch_idx)
+    batch_pred_boxes = pred_boxes[box_index]
+
+    rect_list = [(rect, conf, cls) for cls in batch_pred_boxes
+                 for rect, conf in zip(batch_pred_boxes[cls]['rects'], batch_pred_boxes[cls]['confs'])]
+    rect_list = sorted(rect_list, key=lambda x: -x[1])
+
+    output_rects = []
+    output_strs = []
+    for rect_rank, (rect, conf, cls) in enumerate(rect_list):
+        if conf >= 0.7 or (rect_rank < 3 and top3):
+            output_rects.append(rect.astype(np.int32).tolist())
+            output_strs.append('{}({:.4f})'.format(id_to_name_map[cls], conf))
+
+    return output_rects, output_strs
+
+
+def get_display_gt_boxes(gt_boxes, gt_class_labels, resized_shapes, orig_shapes, id_to_name_map, gt_count=None,
+                         batch_idx=None):
+    # if batch_idx is None we assume this is sample directly from dataset so create artificial batch of size 0
+    if batch_idx is None:
+        gt_boxes = [gt_boxes]
+        gt_class_labels = [gt_class_labels]
+        orig_shapes = [orig_shapes]
+        resized_shapes = [resized_shapes]
+        batch_idx = 0
+        gt_count = None if gt_count is None else [gt_count]
+
+    if gt_count is None:
+        gt_count = gt_boxes[batch_idx].shape[0]
+    else:
+        gt_count = gt_count[batch_idx]
+
+    # orig_shapes and resized_shapes provided as (height, width)
+    scale_x = orig_shapes[batch_idx][1] / resized_shapes[batch_idx][1]
+    scale_y = orig_shapes[batch_idx][0] / resized_shapes[batch_idx][0]
+    rect_list_gt = gt_boxes[batch_idx][:gt_count]
+    if torch.is_tensor(rect_list_gt):
+        rect_list_gt = rect_list_gt.cpu().numpy()
+    rect_list_gt = rect_list_gt.copy()
+    rect_list_gt[:, ::2] *= scale_x
+    rect_list_gt[:, 1::2] *= scale_y
+    class_labels = gt_class_labels[batch_idx][:gt_count]
+    if torch.is_tensor(class_labels):
+        class_labels = class_labels.cpu().numpy()
+    text_list_gt = [id_to_name_map[lid] for lid in class_labels]
+
+    rect_list_gt = rect_list_gt.astype(np.int32).tolist()
+
+    return rect_list_gt, text_list_gt

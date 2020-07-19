@@ -6,34 +6,6 @@ from torchvision.models.utils import load_state_dict_from_url
 import torchvision.ops as ops
 import numpy as np
 from utils.box_utils import compute_iou, choose_anchor_subset, get_loc_labels, get_boxes_from_loc_batch
-import matplotlib.pyplot as plt
-
-
-def show_feat_map(x, title='feats'):
-    x_np = x[0, ...].detach().cpu().numpy()
-    ch = x.shape[1]
-    r = ch // 2**int(np.ceil(np.log2(ch) / 2))
-    c = ch // r
-    # r = c = int(np.ceil(ch**0.5))
-    h, w = x.shape[-2:]
-    res = np.zeros((r * h, c * w))
-    for row in range(r):
-        for col in range(c):
-            ch_id = row * c + col
-            if ch_id < ch:
-                x_ch = x_np[ch_id, :, :]
-                mn = np.min(x_ch)
-                mx = np.max(x_ch)
-                if mx - mn > 0:
-                    res[row * h:(row + 1) * h, col * w:(col + 1) * w] = (x_ch - mn) / (mx - mn)
-                else:
-                    res[row * h:(row + 1) * h, col * w:(col + 1) * w] = x_ch * 0.0
-    fig = plt.figure(figsize=(10, 8), dpi=80)
-    ax = fig.subplots()
-    ax.imshow(res)
-    ax.set_title(title + ' mine')
-    fig.show()
-    # breakpoint()
 
 
 class ResNetWrapper(resnet.ResNet):
@@ -208,17 +180,17 @@ class RegionProposalNetwork(nn.Module):
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
-        # show_feat_map(x, 'rpn feats')
-        # show_feat_map(self.conv_loc(x), 'conv_loc')
-        # show_feat_map(self.conv_obj(x), 'conv_obj')
         pred_loc = self.conv_loc(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
         pred_obj = self.conv_obj(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1, 2)
         return pred_loc, pred_obj
 
 
 class PreprocessHead(nn.Module):
-    def __init__(self):
+    def __init__(self, anchor_boxes, img_shape=(1000, 1000)):
         super().__init__()
+        self.anchor_boxes = torch.from_numpy(anchor_boxes)
+
+        self.img_height, self.img_width = img_shape
         self.n_train_pre_nms = 12000
         self.n_train_post_nms = 2000
         self.n_test_pre_nms = 6000
@@ -226,18 +198,16 @@ class PreprocessHead(nn.Module):
         self.min_size = 16
         self.nms_threshold = 0.7
 
-    def __call__(self, img_shape, anchor_boxes, pred_loc, pred_obj):
-        img_height, img_width = img_shape
-        # currently batch size 1 supported only
-        assert anchor_boxes.shape[0] == 1
-        anchor_boxes = anchor_boxes[0]
+    def __call__(self, pred_loc, pred_obj):
         batch_size = pred_loc.shape[0]
+
+        anchor_boxes = self.anchor_boxes.to(device=pred_loc.device)
 
         pred_loc = pred_loc.detach()
         pred_obj = pred_obj.detach()
         pred_obj_sm = torch.softmax(pred_obj, dim=2)[:, :, 1]
 
-        pred_boxes = get_boxes_from_loc_batch(anchor_boxes, pred_loc, img_width, img_height)
+        pred_boxes = get_boxes_from_loc_batch(anchor_boxes, pred_loc, self.img_height, self.img_width)
 
         pred_boxes_post_nms = []
         for batch_idx in range(batch_size):
@@ -303,15 +273,10 @@ class TrainingProposalSelector:
                 max_iou = iou[range(iou.shape[0]), max_iou_gt_idx]
 
                 pred_positive_idx = np.nonzero(max_iou > self.pos_iou_thresh)[0]
-                # pred_positive_idx = np.array([7, 9, 10, 21, 37, 51, 100, 161, 184, 208, 212,
-                #        268, 277, 311, 315, 443, 464, 636, 820, 873, 973, 1108,
-                #        1218, 1319, 1340, 1562, 1581, 1698, 1699, 1910, 1912, 2000, 2001,
-                #        2002])
                 gt_positive_idx = max_iou_gt_idx[pred_positive_idx]
 
                 pred_negative_idx = np.nonzero((max_iou < self.neg_iou_thresh_hi) &
                                                (max_iou >= self.neg_iou_thresh_low))[0]
-                # pred_negative_idx = np.load('/home/gleason/temp.npy', allow_pickle=True)
             else:
                 pred_positive_idx = np.zeros((0,), dtype=np.int32)
                 gt_positive_idx = np.zeros((0,), dtype=np.int32)
@@ -358,34 +323,28 @@ class TrainingProposalSelector:
 
 
 class FasterRCNN(nn.Module):
-    def __init__(self, num_anchors=9, num_classes=92, return_rpn_output=False, arch='vgg16'):
+    def __init__(self, anchor_boxes, num_anchors=9, num_classes=92, return_rpn_output=False, arch='vgg16',
+                 img_shape=(1000, 1000)):
         super().__init__()
         self.return_rpn_output = return_rpn_output
 
         self.feature_net = FeatureNetVGG16() if arch == 'vgg16' else FeatureNetResNet(arch)
         self.region_proposal_network = RegionProposalNetwork(num_anchors,
                                                              self.feature_net.get_out_channels())
-        self.preprocess_head = PreprocessHead()
+        self.preprocess_head = PreprocessHead(anchor_boxes, img_shape=img_shape)
         self.head = HeadVGG16(num_classes) if arch == 'vgg16' else HeadResNet(num_classes, arch)
         self.training_proposal_selector = TrainingProposalSelector()
 
-    def forward(self, x, anchor_boxes, initial_batch_idx, gt_boxes=None, gt_class_labels=None, gt_count=None):
+    def forward(self, x, initial_batch_idx, gt_boxes=None, gt_class_labels=None, gt_count=None):
         if self.training:
             assert gt_boxes is not None and gt_count is not None and gt_class_labels is not None
-
-        # fig = plt.figure(figsize=(10, 10), dpi=80)
-        # ax = fig.subplots()
-        # ax.imshow(x[0, ...].cpu().numpy().transpose(1, 2, 0))
-        # fig.show()
 
         input_shape = x.shape[-2:]
         x = self.feature_net(x)
 
-        # show_feat_map(x)
-
         pred_loc, pred_obj = self.region_proposal_network(x)
         with torch.no_grad():
-            pred_roi_boxes, pred_roi_batch_idx = self.preprocess_head(input_shape, anchor_boxes, pred_loc, pred_obj)
+            pred_roi_boxes, pred_roi_batch_idx = self.preprocess_head(pred_loc, pred_obj)
             if self.training:
                 pred_roi_boxes, pred_roi_batch_idx, pred_roi_cls_labels, pred_roi_loc_labels \
                     = self.training_proposal_selector(pred_roi_boxes, pred_roi_batch_idx,

@@ -3,11 +3,10 @@ from utils.box_utils import get_anchor_labels
 from utils.data_mappings import voc_name_to_id
 from data.general import compute_scales
 import torchvision.transforms.functional as tvtf
-from utils.box_utils import define_anchor_boxes
 
 
-def create_voc_targets(data, labels, data_transform, min_shape=(600, 600), max_shape=(1000, 1000),
-                       sub_sample=16, pos_iou_thresh=0.7, neg_iou_thresh=0.3, pos_ratio=0.5, num_samples=256,
+def create_voc_targets(data, labels, data_transform, anchor_boxes, min_shape=(600, 600), max_shape=(1000, 1000),
+                       pos_iou_thresh=0.7, neg_iou_thresh=0.3, pos_ratio=0.5, num_samples=256,
                        mark_max_gt_anchors=True, random_flip=False, use_difficult=True):
     flipped = False
     if random_flip and np.random.choice([True, False]):
@@ -20,8 +19,6 @@ def create_voc_targets(data, labels, data_transform, min_shape=(600, 600), max_s
     scale_h, scale_w = compute_scales((orig_height, orig_width), min_shape, max_shape)
     valid_height = int(round(scale_h * orig_height))
     valid_width = int(round(scale_w * orig_width))
-
-    anchor_boxes = define_anchor_boxes(sub_sample, valid_width, valid_height)
 
     num_anchors = anchor_boxes.shape[0]
     valid_anchors = np.nonzero(
@@ -39,6 +36,7 @@ def create_voc_targets(data, labels, data_transform, min_shape=(600, 600), max_s
                                     not int(label['difficult'])], dtype=np.int32)
         gt_difficult = np.array([int(label['difficult']) for label in obj_labels if use_difficult or not
                                  int(label['difficult'])], dtype=np.bool)
+        # tested, x/y-min/max use matlab indexing (e.g. xmin, xmax = 1, img_width corresponds to entire image)
         gt_boxes = np.array([[int(label['bndbox'][k]) - 1 for k in ['xmin', 'ymin', 'xmax', 'ymax']]
                               for label in obj_labels if use_difficult or not int(label['difficult'])], dtype=np.float32)
         gt_boxes[:, :2] -= 0.5
@@ -79,5 +77,5 @@ def create_voc_targets(data, labels, data_transform, min_shape=(600, 600), max_s
     valid_shape = (valid_height, valid_width)
 
     # gt_boxes and gt_class_labels need to be ignored during collate
-    return data_transform(data), (anchor_boxes, anchor_obj_final, anchor_loc_final, gt_boxes, gt_class_labels,
+    return data_transform(data), (anchor_obj_final, anchor_loc_final, gt_boxes, gt_class_labels,
                                   gt_image_id, gt_difficult, ignore, valid_shape, orig_img)
