@@ -30,6 +30,9 @@ from models.criterion import FasterRCNNCriterion
 
 from third_party.eval_tool import compute_map_voc
 
+# TODO use config files instead
+# TODO compute anchors only once you actually know the shape of the feature map
+
 parser = argparse.ArgumentParser('Training code for simple Faster-RCNN implementation')
 parser.add_argument('dataset', default='voc', type=str, choices={'voc', 'coco'},
                     help='Which dataset to train on')
@@ -99,7 +102,6 @@ def load_datasets(min_shape=(600, 600), max_shape=(1000, 1000), sub_sample=16, c
     val_transforms_list.append(CreateRPNLabels(sub_sample=sub_sample, ceil_mode=ceil_mode))
 
     if args.dataset == 'coco':
-        # TODO Fix COCO dataset
         print('Loading MSCOCO Detection dataset')
         train_transforms_list.insert(0, FormatCOCOLabels())
         val_transforms_list.insert(0, FormatCOCOLabels())
@@ -348,7 +350,7 @@ def validate(epoch, writer, model, val_loader, save_pred_filename='', save_gt_fi
         coco_gt_file = os.path.join(args.coco_root, 'annotations/instances_val2017.json')
         validate_map = compute_map_coco(coco_gt_file, preds, image_ids)
     else:
-        # TODO explore small difference between my implementation (compute_map) and third party (compute_map_voc)
+        # TODO explore differences between my implementation (compute_map) and third party (compute_map_voc)
         # validate_map = compute_map(gt, preds)
         validate_map = compute_map_voc(gt, preds, use_07_metric=True)
 

@@ -97,7 +97,7 @@ class HeadResNet(ResNetWrapper):
         pred_indices_and_boxes = np.concatenate((pred_batch_idx.reshape(-1, 1), pred_boxes), axis=1)
         pred_indices_and_boxes = torch.from_numpy(pred_indices_and_boxes).to(x)
 
-        # TODO should I use roi_align?
+        # TODO should I use roi_align? Roi sampling should be configurable
         # regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
         regions = ops.roi_pool(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
         y = self.avgpool(self.layer4(regions))
@@ -165,7 +165,7 @@ class HeadVGG16(nn.Module):
         pred_indices_and_boxes = np.concatenate((pred_batch_idx.reshape(-1, 1).astype(np.float32), pred_boxes), axis=1)
         pred_indices_and_boxes = torch.from_numpy(pred_indices_and_boxes).to(x)
 
-        # TODO should I use roi_align?
+        # TODO should I use roi_align? Roi sampling should be configurable
         # regions = ops.roi_align(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
         regions = ops.roi_pool(x, pred_indices_and_boxes, self.roi_align_size, self.spatial_scale)
         y = self.classifier(torch.flatten(regions, start_dim=1))
