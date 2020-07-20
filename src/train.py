@@ -482,7 +482,7 @@ def train(writer):
 
 def main():
     datestr = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tensorboard_dir = '../tensorboard/' + args.dataset + '_' + datestr
+    tensorboard_dir = '../tensorboard/' + args.dataset + '_' + args.arch + '_' + datestr
     print('Writing tensorboard output to', tensorboard_dir)
     writer = SummaryWriter(tensorboard_dir)
     try:
