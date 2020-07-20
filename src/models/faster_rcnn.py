@@ -50,6 +50,10 @@ class FeatureNetResNet(ResNetWrapper):
     def get_sub_sample(self):
         return 16
 
+    def get_ceil_mode(self):
+        # TODO test this for all arch
+        return True
+
     def forward(self, x):
         x = self.conv1(x)
         x = self.bn1(x)
@@ -122,6 +126,9 @@ class FeatureNetVGG16(nn.Module):
 
     def get_sub_sample(self):
         return 16
+
+    def get_ceil_mode(self):
+        return False
 
     def forward(self, x):
         x = self.features(x)
@@ -202,7 +209,7 @@ class PreprocessHead(nn.Module):
         self.min_size = 16
         self.nms_threshold = 0.7
 
-    def __call__(self, pred_loc, pred_obj, img_shape, sub_sample=16):
+    def __call__(self, pred_loc, pred_obj, img_shape, sub_sample=16, ceil_mode=False):
         batch_size = pred_loc.shape[0]
 
         pred_loc = pred_loc.detach()
@@ -212,7 +219,7 @@ class PreprocessHead(nn.Module):
         # TODO currently defining anchor boxes twice (once here and once for creating rpn loss targets) would be nice
         # if this wasn't done twice but can't think of elegant way to avoid it
         img_height, img_width = img_shape
-        anchor_boxes = create_anchor_boxes(img_height, img_width, sub_sample)
+        anchor_boxes = create_anchor_boxes(img_height, img_width, sub_sample, ceil_mode)
         anchor_boxes = torch.from_numpy(anchor_boxes).to(device=pred_loc.device)
 
         pred_boxes = get_boxes_from_loc_batch(anchor_boxes, pred_loc, img_height, img_width)
@@ -353,7 +360,8 @@ class FasterRCNN(nn.Module):
         pred_loc, pred_obj = self.region_proposal_network(x)
         with torch.no_grad():
             pred_roi_boxes, pred_roi_batch_idx = self.preprocess_head(
-                pred_loc, pred_obj, input_shape, self.feature_net.get_sub_sample())
+                pred_loc, pred_obj, input_shape, self.feature_net.get_sub_sample(),
+                self.feature_net.get_ceil_mode())
             if self.training:
                 pred_roi_boxes, pred_roi_batch_idx, pred_roi_cls_labels, pred_roi_loc_labels \
                     = self.training_proposal_selector(pred_roi_boxes, pred_roi_batch_idx,
@@ -385,4 +393,7 @@ class FasterRCNN(nn.Module):
         return output
 
     def get_sub_sample(self):
-        return self.feature_net.sub_sample()
+        return self.feature_net.get_sub_sample()
+
+    def get_ceil_mode(self):
+        return self.feature_net.get_ceil_mode()

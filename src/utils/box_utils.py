@@ -20,16 +20,29 @@ def compute_iou(boxes1, boxes2):
 def choose_anchor_subset(num_samples, pos_ratio, len_positive, len_negative):
     num_positive = min(int(round(num_samples * pos_ratio)), len_positive)
     num_negative = num_samples - num_positive
+    replace_positive = False
+    replace_negative = False
     if num_negative > len_negative:
         # shouldn't happen unless image is just packed with objects, but just in case
         num_negative = len_negative
         num_positive = num_samples - num_negative
 
-        # if this assert fails then reduce num_samples or loosen the thresholds
-        assert num_positive <= len_positive
+        # final case, if this condition fails then there aren't enough total boxes selected by preprocess head. Either
+        # NMS returned too few or num_samples is too large. Allow repeats in this case.
+        if num_positive > len_positive:
+            if len_negative > 0:
+                num_positive = len_positive
+                num_negative = num_samples - len_positive
+                replace_negative = True
+            else:
+                # if this fails then we are in trouble that means both total number of positive+negative = 0
+                assert len_positive > 0
+                num_positive = num_samples
+                num_negative = 0
+                replace_positive = True
 
-    positive_choice = np.random.choice(np.arange(len_positive), num_positive, replace=False)
-    negative_choice = np.random.choice(np.arange(len_negative), num_negative, replace=False)
+    positive_choice = np.random.choice(np.arange(len_positive), num_positive, replace=replace_positive)
+    negative_choice = np.random.choice(np.arange(len_negative), num_negative, replace=replace_negative)
 
     return positive_choice, negative_choice
 
@@ -250,8 +263,11 @@ def select_roi_indices(anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh, 
     return anchor_positive_index, anchor_negative_index, anchor_positive_class_labels, anchor_positive_loc_labels
 
 
-def create_anchor_boxes(height, width, sub_sample=16):
-    feature_map_w, feature_map_h = (width // sub_sample), (height // sub_sample)
+def create_anchor_boxes(height, width, sub_sample=16, ceil_mode=False):
+    if ceil_mode:
+        feature_map_w, feature_map_h = int(np.ceil(width / sub_sample)), int(np.ceil(height / sub_sample))
+    else:
+        feature_map_w, feature_map_h = int(width // sub_sample), int(height // sub_sample)
 
     # using np.array
     ratios = np.array((2, 1, 0.5), dtype=np.float32).reshape(-1, 1)
@@ -271,12 +287,15 @@ def create_anchor_boxes(height, width, sub_sample=16):
     return anchor_boxes
 
 
-def create_rpn_targets(input_shape, valid_shape, gt_boxes, gt_class_labels, sub_sample=16, pos_iou_thresh=0.7,
-                       neg_iou_thresh=0.3, pos_ratio=0.5, num_samples=256, mark_max_gt_anchors=True):
+def create_rpn_targets(input_shape, valid_shape, gt_boxes, gt_class_labels, sub_sample=16, ceil_mode=False,
+                       pos_iou_thresh=0.7, neg_iou_thresh=0.3, pos_ratio=0.5, num_samples=256,
+                       mark_max_gt_anchors=True):
     input_height, input_width = input_shape
     valid_height, valid_width = valid_shape
 
-    anchor_boxes = create_anchor_boxes(input_height, input_width, sub_sample)
+    # TODO currently defining anchor boxes twice (once in preprocess head and once here) would be nice to do just once
+    # but can't think of elegant way to avoid doing it twice.
+    anchor_boxes = create_anchor_boxes(input_height, input_width, sub_sample, ceil_mode)
     num_anchors = anchor_boxes.shape[0]
 
     valid_anchor_indices = np.nonzero(

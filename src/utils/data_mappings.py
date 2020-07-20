@@ -220,3 +220,8 @@ voc_name_to_id = {name: index for index, name in enumerate(voc_names)}
 
 # including __unlabled__
 voc_num_obj_classes = len(voc_names)
+
+num_obj_classes_dict = {
+    'coco': coco_num_obj_classes,
+    'voc': voc_num_obj_classes
+}

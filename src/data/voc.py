@@ -2,7 +2,7 @@ import numpy as np
 from utils.data_mappings import voc_name_to_id
 
 
-class FormatVOCLabels:
+class FormatVOCLabels(object):
     def __init__(self, use_difficult=True):
         self.use_difficult = use_difficult
 

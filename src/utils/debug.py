@@ -35,7 +35,8 @@ def debug_dataset_view(dataset, id_to_name_map):
         # draw positive anchor boxes
         from utils.box_utils import create_anchor_boxes, create_rpn_targets, get_boxes_from_loc
         anchor_boxes = create_anchor_boxes(input_height, input_width, 16)
-        anchor_obj_final, anchor_loc_final = create_rpn_targets(anchor_boxes, valid_shape, gt_boxes, gt_class_labels)
+        anchor_obj_final, anchor_loc_final = create_rpn_targets((input_height, input_width), valid_shape, gt_boxes,
+                                                                gt_class_labels)
 
         pos_indices = np.nonzero(anchor_obj_final > 0)[0]
         pos_boxes = anchor_boxes[pos_indices, :]

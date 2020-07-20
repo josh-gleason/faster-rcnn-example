@@ -7,20 +7,24 @@ from PIL import Image
 from utils.box_utils import create_rpn_targets
 
 
-def compute_scales(orig_shape, min_shape, max_shape):
+def compute_scales(orig_shape, min_shape, max_shape, stretch_to_max=False):
     orig_height, orig_width = orig_shape
     max_height, max_width = max_shape
     min_height, min_width = min_shape
 
-    scale_h_min = float(min_height) / orig_height
-    scale_w_min = float(min_width) / orig_width
-    scale_min = max(scale_w_min, scale_h_min)
+    if stretch_to_max:
+        scale_h = max_height / orig_height
+        scale_w = max_width / orig_width
+    else:
+        scale_h_min = float(min_height) / orig_height
+        scale_w_min = float(min_width) / orig_width
+        scale_min = max(scale_w_min, scale_h_min)
 
-    scale_h_max = float(max_height) / orig_height
-    scale_w_max = float(max_width) / orig_width
-    scale_max = min(scale_h_max, scale_w_max)
+        scale_h_max = float(max_height) / orig_height
+        scale_w_max = float(max_width) / orig_width
+        scale_max = min(scale_h_max, scale_w_max)
 
-    scale_h = scale_w = min(scale_max, scale_min)
+        scale_h = scale_w = min(scale_max, scale_min)
 
     # make sure both scales result in integer length
     scale_h = round(scale_h * orig_height) / orig_height
@@ -80,7 +84,8 @@ class DynamicResize(object):
         Image.BOX: 'PIL.Image.BOX',
     }
 
-    def __init__(self, min_shape=(600, 600), max_shape=(1000, 1000), interpolation=Image.BILINEAR):
+    def __init__(self, min_shape=(600, 600), max_shape=(1000, 1000), interpolation=Image.BILINEAR,
+                 stretch_to_max=False):
         """ Resize the image so that image to fit into min_shape/max_shape. See compute_scales for more information.
 
         Args:
@@ -88,14 +93,16 @@ class DynamicResize(object):
             max_shape: (h, w) maximum shape of image.
             interpolation: Type of interpolation, one of Image.NEAREST, Image.BILINEAR, Image.BICUBIC, Image.LANCZOS,
                 Image.HAMMING, or Image.BOX.
+            stretch_to_max: (bool): If true then stretch image to max_shape, otherwise maintain original aspect ratio.
         """
         self.min_shape = min_shape
         self.max_shape = max_shape
         self.interpolation = interpolation
+        self.stretch_to_max = stretch_to_max
 
     def __call__(self, img, labels):
         img_width, img_height = img.size
-        scale_h, scale_w = compute_scales((img_height, img_width), self.min_shape, self.max_shape)
+        scale_h, scale_w = compute_scales((img_height, img_width), self.min_shape, self.max_shape, self.stretch_to_max)
         scaled_height = int(round(scale_h * img_height))
         scaled_width = int(round(scale_w * img_width))
         labels['valid_shape'] = np.array((scaled_height, scaled_width), dtype=np.int64)
@@ -133,22 +140,22 @@ class PadToShape(object):
 class CreateRPNLabels(object):
     """ Create RPN targets and add them to the labels dict. Assumes all other manipulations have been finished """
 
-    def __init__(self, sub_sample=16):
+    def __init__(self, sub_sample=16, ceil_mode=False):
         self.sub_sample = sub_sample
+        self.ceil_mode = ceil_mode
 
     def __call__(self, img, labels):
         assert torch.is_tensor(img)
         img_height, img_width = img.shape[-2:]
         rpn_obj_label, rpn_loc_label = create_rpn_targets(
             (img_height, img_width), labels['valid_shape'], labels['gt_boxes'], labels['gt_class_labels'],
-            self.sub_sample)
+            self.sub_sample, self.ceil_mode)
         labels['rpn_obj_label'] = rpn_obj_label
         labels['rpn_loc_label'] = rpn_loc_label
         return img, labels
 
     def __repr__(self):
         return f'{self.__class__.__name__}(sub_sample={self.sub_sample})'
-
 
 
 def faster_rcnn_collate_fn(batch):

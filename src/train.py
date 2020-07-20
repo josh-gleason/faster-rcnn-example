@@ -3,7 +3,6 @@ from tqdm import tqdm
 from datetime import datetime
 import shutil
 import argparse
-from functools import partial
 from collections import defaultdict
 
 import numpy as np
@@ -16,14 +15,13 @@ from torchvision import transforms as tvt
 from torchvision.datasets.vision import StandardTransform
 import torchvision.transforms.functional as tvtf
 
-from data.coco import CocoDetectionWithImgId, create_coco_targets
+from data.coco import CocoDetectionWithImgId, FormatCOCOLabels
 from data.voc import FormatVOCLabels
 from data.general import faster_rcnn_collate_fn, DynamicResize, PadToShape, ComposeTransforms, RandomHorizontalFlip, \
     CreateRPNLabels
 
-from utils.data_mappings import coco_num_obj_classes, voc_num_obj_classes, coco_id_to_name, voc_id_to_name
-from utils.box_utils import create_anchor_boxes, get_boxes_from_output, get_display_gt_boxes, get_display_pred_boxes, \
-    create_rpn_targets
+from utils.data_mappings import coco_id_to_name, voc_id_to_name, num_obj_classes_dict
+from utils.box_utils import get_boxes_from_output, get_display_gt_boxes, get_display_pred_boxes
 from utils.image_utils import draw_detections
 from utils.metrics import compute_map, compute_map_coco, save_coco_style, AverageMeter
 
@@ -79,48 +77,40 @@ parser.add_argument('--quick-validate', '-qv', action='store_true',
 args = parser.parse_args()
 
 
-def load_datasets(min_shape=(600, 600), max_shape=(1000, 1000), pad_to_max=True, sub_sample=16):
+def load_datasets(min_shape=(600, 600), max_shape=(1000, 1000), sub_sample=16, ceil_mode=False,
+                  pad_to_max=True, stretch_to_max=False):
     mean_val = [0.485, 0.456, 0.406]
     std_val = [0.229, 0.224, 0.225]
     train_transforms_list = [
         RandomHorizontalFlip(0.5),
-        DynamicResize(min_shape, max_shape),
+        DynamicResize(min_shape, max_shape, stretch_to_max=stretch_to_max),
         StandardTransform(tvt.ToTensor()),
         StandardTransform(tvt.Normalize(mean_val, std_val)),
-        CreateRPNLabels(sub_sample=sub_sample)
     ]
     val_transforms_list = [
-        DynamicResize(min_shape, max_shape),
+        DynamicResize(min_shape, max_shape, stretch_to_max=stretch_to_max),
         StandardTransform(tvt.ToTensor()),
         StandardTransform(tvt.Normalize(mean_val, std_val)),
-        CreateRPNLabels(sub_sample=sub_sample)
     ]
     if pad_to_max:
         train_transforms_list.append(StandardTransform(PadToShape(max_shape)))
         val_transforms_list.append(StandardTransform(PadToShape(max_shape)))
+    train_transforms_list.append(CreateRPNLabels(sub_sample=sub_sample, ceil_mode=ceil_mode))
+    val_transforms_list.append(CreateRPNLabels(sub_sample=sub_sample, ceil_mode=ceil_mode))
 
     if args.dataset == 'coco':
         # TODO Fix COCO dataset
         print('Loading MSCOCO Detection dataset')
-        base_transforms = partial(create_coco_targets, anchor_boxes=anchor_boxes, min_shape=min_shape,
-                                  max_shape=max_shape)
+        train_transforms_list.insert(0, FormatCOCOLabels())
+        val_transforms_list.insert(0, FormatCOCOLabels())
 
-        train_transforms = partial(base_transforms, data_transform=train_transform, random_flip=True)
-        val_transforms = partial(base_transforms, data_transform=val_transform)
+        train_transforms = ComposeTransforms(train_transforms_list)
+        val_transforms = ComposeTransforms(val_transforms_list)
 
-        train_dataset = CocoDetectionWithImgId(
-            os.path.join(args.coco_root, 'images/train2017'),
-            os.path.join(args.coco_root, 'annotations/instances_train2017.json'),
-            transforms=train_transforms,
-        )
-
-        val_dataset = CocoDetectionWithImgId(
-            os.path.join(args.coco_root, 'images/val2017'),
-            os.path.join(args.coco_root, 'annotations/instances_val2017.json'),
-            transforms=val_transforms,
-        )
-
-        num_classes = coco_num_obj_classes
+        train_dataset = CocoDetectionWithImgId(args.coco_root, image_set='train', download=True,
+                                               transforms=train_transforms)
+        val_dataset = CocoDetectionWithImgId(args.coco_root, image_set='val', download=True,
+                                             transforms=val_transforms)
     elif args.dataset == 'voc':
         print('Loading Pascal VOC 2007 Detection dataset')
         train_transforms_list.insert(0, FormatVOCLabels(use_difficult=False))
@@ -138,17 +128,17 @@ def load_datasets(min_shape=(600, 600), max_shape=(1000, 1000), pad_to_max=True,
 
         val_dataset = datasets.VOCDetection(args.voc_root, year='2007', download=download,
                                             image_set='test', transforms=val_transforms)
-
-        num_classes = voc_num_obj_classes
     else:
         raise ValueError
 
-    # TODO REMOVE ME!!!
-    # from utils.debug import debug_dataset_view
-    # debug_dataset_view(train_dataset, voc_id_to_name)
+    # print("DONT LEAVE THIS!!!")
+    # r = np.random.choice(np.arange(len(train_dataset)), 100, replace=False)
+    # train_dataset = torch.utils.data.Subset(train_dataset, r)
+    # r = np.random.choice(np.arange(len(val_dataset)), 100, replace=False)
+    # val_dataset = torch.utils.data.Subset(val_dataset, r)
 
-    train_dataset = torch.utils.data.Subset(train_dataset, range(100))
-    val_dataset = torch.utils.data.Subset(val_dataset, range(100))
+    from utils.debug import debug_dataset_view
+    debug_dataset_view(train_dataset, coco_id_to_name)
 
     train_sampler = torch.utils.data.RandomSampler(train_dataset)
 
@@ -172,14 +162,14 @@ def load_datasets(min_shape=(600, 600), max_shape=(1000, 1000), pad_to_max=True,
         pin_memory=True
     )
 
-    return train_loader, val_loader, num_classes
+    return train_loader, val_loader
 
 
 def load_checkpoint(model, criterion, optimizer, lr_scheduler):
     print('====================================================')
     print('loading checkpoint', args.resume)
     checkpoint = torch.load(args.resume)
-    model.load_state_dict(checkpoint['model.state_dict'])
+    model.module.load_state_dict(checkpoint['model.state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer.state_dict'])
     criterion.load_state_dict(checkpoint['criterion.state_dict'])
     lr_scheduler.load_state_dict(checkpoint['lr_scheduler.state_dict'])
@@ -197,7 +187,7 @@ def save_checkpoint(model, criterion, optimizer, lr_scheduler, epoch, best_map, 
     checkpoint_name = args.checkpoint_format.format(epoch=epoch, best_map=best_map)
     print('Saving checkpoint to', checkpoint_name)
     checkpoint = {
-        'model.state_dict': model.state_dict(),
+        'model.state_dict': model.module.state_dict(),
         'optimizer.state_dict': optimizer.state_dict(),
         'criterion.state_dict': criterion.state_dict(),
         'lr_scheduler.state_dict': lr_scheduler.state_dict(),
@@ -232,14 +222,9 @@ def get_optimizer(model, lr=0.01, weight_decay=5e-4, use_adam=True):
         return torch.optim.SGD(params, lr=lr, momentum=0.9)
 
 
-def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_loader):
+def train_epoch(epoch, writer, model, criterion, optimizer, train_loader, average_meters):
     model.train()
     optimizer.zero_grad()
-    loss_avg = AverageMeter(0.998)
-    rpn_obj_loss_avg = AverageMeter(0.998)
-    rpn_loc_loss_avg = AverageMeter(0.998)
-    roi_cls_loss_avg = AverageMeter(0.998)
-    roi_loc_loss_avg = AverageMeter(0.998)
 
     id_to_name_map = coco_id_to_name if args.dataset == 'coco' else voc_id_to_name
     with tqdm(total=len(train_loader), ncols=0, desc='Training Epoch {}'.format(epoch)) as pbar:
@@ -259,11 +244,11 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
                 = criterion(**output, anchor_obj=rpn_obj_labels, anchor_loc=rpn_loc_labels)
 
             batch_size = data.shape[0]
-            loss_avg.update(loss.item(), batch_size)
-            rpn_obj_loss_avg.update(rpn_obj_loss.item(), batch_size)
-            rpn_loc_loss_avg.update(rpn_loc_loss.item(), batch_size)
-            roi_cls_loss_avg.update(roi_cls_loss.item(), batch_size)
-            roi_loc_loss_avg.update(roi_loc_loss.item(), batch_size)
+            average_meters['loss_avg'].update(loss.item(), batch_size)
+            average_meters['rpn_obj_loss_avg'].update(rpn_obj_loss.item(), batch_size)
+            average_meters['rpn_loc_loss_avg'].update(rpn_loc_loss.item(), batch_size)
+            average_meters['roi_cls_loss_avg'].update(roi_cls_loss.item(), batch_size)
+            average_meters['roi_loc_loss_avg'].update(roi_loc_loss.item(), batch_size)
 
             loss_scaled = loss / float(args.batches_per_optimizer_step)
             loss_scaled.backward()
@@ -295,16 +280,21 @@ def train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_
                                   torch.stack((tvtf.to_tensor(gt_img), tvtf.to_tensor(pred_img)), dim=0),
                                   global_step=batch_num // args.print_freq)
 
-                writer.add_scalar('Loss/train loss'.format(epoch), loss_avg.average, batch_num)
-                writer.add_scalar('Loss/train rpn_obj_loss'.format(epoch), rpn_obj_loss_avg.average, batch_num)
-                writer.add_scalar('Loss/train rpn_loc_loss'.format(epoch), rpn_loc_loss_avg.average, batch_num)
-                writer.add_scalar('Loss/train roi_cls_loss'.format(epoch), roi_cls_loss_avg.average, batch_num)
-                writer.add_scalar('Loss/train roi_loc_loss'.format(epoch), roi_loc_loss_avg.average, batch_num)
+                writer.add_scalar('Loss/train loss'.format(epoch), average_meters['loss_avg'].average,
+                                  average_meters['loss_avg'].count)
+                writer.add_scalar('Loss/train rpn_obj_loss'.format(epoch), average_meters['rpn_obj_loss_avg'].average,
+                                  average_meters['rpn_obj_loss_avg'].count)
+                writer.add_scalar('Loss/train rpn_loc_loss'.format(epoch), average_meters['rpn_loc_loss_avg'].average,
+                                  average_meters['rpn_loc_loss_avg'].count)
+                writer.add_scalar('Loss/train roi_cls_loss'.format(epoch), average_meters['roi_cls_loss_avg'].average,
+                                  average_meters['roi_cls_loss_avg'].count)
+                writer.add_scalar('Loss/train roi_loc_loss'.format(epoch), average_meters['roi_loc_loss_avg'].average,
+                                  average_meters['roi_loc_loss_avg'].count)
 
             pbar.update()
 
 
-def validate(writer, model, val_loader, save_pred_filename='', save_gt_filename='', save_coco_filename=''):
+def validate(epoch, writer, model, val_loader, save_pred_filename='', save_gt_filename='', save_coco_filename=''):
     model.eval()
     with torch.no_grad():
         preds = []
@@ -372,19 +362,19 @@ def validate(writer, model, val_loader, save_pred_filename='', save_gt_filename=
         validate_map = compute_map_voc(gt, preds, use_07_metric=True)
 
     print('mAP score @ 0.5 IoU: {:.5}'.format(validate_map))
+    writer.add_scalar('Validate/mAP', validate_map, epoch)
     return validate_map
 
 
-def eval_examples(writer, model, val_loader, epoch, num_shown_examples=10):
+def eval_examples(epoch, writer, model, val_loader, num_shown_examples=10):
     id_to_name_map = coco_id_to_name if args.dataset == 'coco' else voc_id_to_name
 
     model.eval()
     with torch.no_grad():
-        total = min(int(num_shown_examples // args.test_batch_size), len(val_loader))
+        total = min(int(np.ceil(num_shown_examples / args.test_batch_size)), len(val_loader))
         with tqdm(total=total, ncols=0, desc='Val Examples') as pbar:
             shown_examples = 0
-            for batch_num, (data, labels) in tqdm(enumerate(val_loader), total=len(val_loader), ncols=0,
-                                                  desc='Validation'):
+            for batch_num, (data, labels) in enumerate(val_loader):
                 data = data.cuda()
                 data_batch_idx = labels['batch_idx'].cuda()
                 output = model(data, data_batch_idx)
@@ -398,9 +388,6 @@ def eval_examples(writer, model, val_loader, epoch, num_shown_examples=10):
 
                 orig_shapes = {batch_idx: (img.size[1], img.size[0]) for batch_idx, img in enumerate(original_imgs)}
                 for batch_idx in range(batch_size):
-                    if shown_examples >= num_shown_examples:
-                        pbar.update()
-                        return
                     img = original_imgs[batch_idx]
 
                     rect_list_pred, text_list_pred = get_display_pred_boxes(output, valid_shapes, orig_shapes,
@@ -416,8 +403,12 @@ def eval_examples(writer, model, val_loader, epoch, num_shown_examples=10):
                                       global_step=epoch)
 
                     shown_examples += 1
+                    if shown_examples >= num_shown_examples:
+                        break
 
                 pbar.update()
+                if shown_examples >= num_shown_examples:
+                    break
 
 
 def train(writer):
@@ -426,15 +417,18 @@ def train(writer):
     max_height = 1000
     max_width = 1000
 
-    # TODO if pad_to_max=False then don't allow train/test batch size > 1
-    # define datasets
-    train_loader, val_loader, num_classes = load_datasets((min_height, min_width), (max_height, max_width),
-                                                          pad_to_max=False)
+    num_classes = num_obj_classes_dict[args.dataset]
 
     # define model
     model = FasterRCNN(num_classes=num_classes, return_rpn_output=True, arch=args.arch)
-    # model = torch.nn.DataParallel(model).cuda()
-    model.cuda()
+    model = torch.nn.DataParallel(model).cuda()
+
+    # define datasets
+    # TODO if pad_to_max==False and stretch_to_max==False then don't allow train/test batch size > 1
+    train_loader, val_loader = load_datasets((min_height, min_width), (max_height, max_width),
+                                             sub_sample=model.module.get_sub_sample(),
+                                             ceil_mode=model.module.get_ceil_mode(),
+                                             pad_to_max=False, stretch_to_max=False)
 
     # define optimizer
     optimizer = get_optimizer(model, args.learning_rate, args.weight_decay, args.use_adam)
@@ -443,8 +437,7 @@ def train(writer):
     criterion = FasterRCNNCriterion()
 
     # define lr schedule
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, args.lr_step_freq, args.lr_step_gamma)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_step_freq, args.lr_step_gamma)
 
     # load checkpoint
     start_epoch = 0
@@ -454,26 +447,30 @@ def train(writer):
 
     # validate only if indicated
     if args.validate:
-        eval_examples(writer, model, val_loader, start_epoch)
+        eval_examples(start_epoch, writer, model, val_loader)
         if not args.quick_validate:
-            validate_map = validate(writer, model, val_loader)
+            validate(start_epoch, writer, model, val_loader)
         return
 
     # train
+    average_meters = {
+        'loss_avg': AverageMeter(0.998),
+        'rpn_obj_loss_avg': AverageMeter(0.998),
+        'rpn_loc_loss_avg': AverageMeter(0.998),
+        'roi_cls_loss_avg': AverageMeter(0.998),
+        'roi_loc_loss_avg': AverageMeter(0.998)}
     for epoch in range(start_epoch, args.num_epochs):
-        train_epoch(epoch, writer, model, criterion, optimizer, lr_scheduler, train_loader)
+        train_epoch(epoch, writer, model, criterion, optimizer, train_loader, average_meters)
         lr_scheduler.step()
 
         # save a checkpoint now, will overwrite with real one after validation (useful if validation crashes)
         save_checkpoint(model, criterion, optimizer, lr_scheduler, epoch, -1.0, False)
 
-        eval_examples(writer, model, val_loader, epoch)
+        eval_examples(epoch, writer, model, val_loader)
         if not args.quick_validate:
-            validate_map = validate(writer, model, val_loader)
+            validate_map = validate(epoch, writer, model, val_loader)
         else:
             validate_map = 0.0
-
-        writer.add_scalar('Validate/mAP', validate_map, epoch)
 
         is_best = validate_map > best_map
         if is_best:

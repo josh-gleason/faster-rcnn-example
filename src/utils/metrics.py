@@ -215,7 +215,7 @@ class AverageMeter:
                 self._running_value += self._value * batch_size
             else:
                 self._running_value = self._value * batch_size
-            self._count += batch_size
+        self._count += batch_size
 
     @property
     def average(self):
