@@ -2,7 +2,7 @@ import os
 from torchvision import datasets
 from PIL import Image
 import numpy as np
-from utils.box_utils import get_anchor_labels
+from utils.box_utils import select_roi_indices
 
 
 class CocoDetectionWithImgId(datasets.CocoDetection):
@@ -53,8 +53,8 @@ def create_coco_targets(data, labels, image_id, data_transform, resize_shape, an
     valid_anchor_boxes = anchor_boxes[valid_anchors, :]
 
     valid_positive_index, valid_negative_index, positive_class, positive_loc = \
-        get_anchor_labels(valid_anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh,
-                          neg_iou_thresh, pos_ratio, num_samples, mark_max_gt_anchors)
+        select_roi_indices(valid_anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh,
+                           neg_iou_thresh, pos_ratio, num_samples, mark_max_gt_anchors)
 
     positive_index = valid_anchors[valid_positive_index]
     negative_index = valid_anchors[valid_negative_index]

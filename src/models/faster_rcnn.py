@@ -5,7 +5,8 @@ from torchvision.models import resnet, vgg16
 from torchvision.models.utils import load_state_dict_from_url
 import torchvision.ops as ops
 import numpy as np
-from utils.box_utils import compute_iou, choose_anchor_subset, get_loc_labels, get_boxes_from_loc_batch
+from utils.box_utils import compute_iou, choose_anchor_subset, get_loc_labels, get_boxes_from_loc_batch, \
+    create_anchor_boxes
 
 
 class ResNetWrapper(resnet.ResNet):
@@ -45,6 +46,9 @@ class FeatureNetResNet(ResNetWrapper):
 
     def get_out_channels(self):
         return self.layer3_out_channels[self.arch]
+
+    def get_sub_sample(self):
+        return 16
 
     def forward(self, x):
         x = self.conv1(x)
@@ -116,6 +120,9 @@ class FeatureNetVGG16(nn.Module):
     def get_out_channels(self):
         return 512
 
+    def get_sub_sample(self):
+        return 16
+
     def forward(self, x):
         x = self.features(x)
         return x
@@ -186,11 +193,8 @@ class RegionProposalNetwork(nn.Module):
 
 
 class PreprocessHead(nn.Module):
-    def __init__(self, anchor_boxes, img_shape=(1000, 1000)):
+    def __init__(self):
         super().__init__()
-        self.anchor_boxes = torch.from_numpy(anchor_boxes)
-
-        self.img_height, self.img_width = img_shape
         self.n_train_pre_nms = 12000
         self.n_train_post_nms = 2000
         self.n_test_pre_nms = 6000
@@ -198,16 +202,20 @@ class PreprocessHead(nn.Module):
         self.min_size = 16
         self.nms_threshold = 0.7
 
-    def __call__(self, pred_loc, pred_obj):
+    def __call__(self, pred_loc, pred_obj, img_shape, sub_sample=16):
         batch_size = pred_loc.shape[0]
-
-        anchor_boxes = self.anchor_boxes.to(device=pred_loc.device)
 
         pred_loc = pred_loc.detach()
         pred_obj = pred_obj.detach()
         pred_obj_sm = torch.softmax(pred_obj, dim=2)[:, :, 1]
 
-        pred_boxes = get_boxes_from_loc_batch(anchor_boxes, pred_loc, self.img_height, self.img_width)
+        # TODO currently defining anchor boxes twice (once here and once for creating rpn loss targets) would be nice
+        # if this wasn't done twice but can't think of elegant way to avoid it
+        img_height, img_width = img_shape
+        anchor_boxes = create_anchor_boxes(img_height, img_width, sub_sample)
+        anchor_boxes = torch.from_numpy(anchor_boxes).to(device=pred_loc.device)
+
+        pred_boxes = get_boxes_from_loc_batch(anchor_boxes, pred_loc, img_height, img_width)
 
         pred_boxes_post_nms = []
         for batch_idx in range(batch_size):
@@ -240,7 +248,8 @@ class PreprocessHead(nn.Module):
 
 
 class TrainingProposalSelector:
-    def __init__(self, num_samples=128, pos_ratio=0.25, pos_iou_thresh=0.5, neg_iou_thresh_hi=0.5, neg_iou_thresh_low=0.0, loc_mean=(0.0, 0.0, 0.0, 0.0), loc_std=(0.1, 0.1, 0.2, 0.2)):
+    def __init__(self, num_samples=128, pos_ratio=0.25, pos_iou_thresh=0.5, neg_iou_thresh_hi=0.5,
+                 neg_iou_thresh_low=0.0, loc_mean=(0.0, 0.0, 0.0, 0.0), loc_std=(0.1, 0.1, 0.2, 0.2)):
         self.num_samples = num_samples
         self.pos_ratio = pos_ratio
         self.pos_iou_thresh = pos_iou_thresh
@@ -323,15 +332,14 @@ class TrainingProposalSelector:
 
 
 class FasterRCNN(nn.Module):
-    def __init__(self, anchor_boxes, num_anchors=9, num_classes=92, return_rpn_output=False, arch='vgg16',
-                 img_shape=(1000, 1000)):
+    def __init__(self, num_anchors=9, num_classes=92, return_rpn_output=False, arch='vgg16'):
         super().__init__()
         self.return_rpn_output = return_rpn_output
 
         self.feature_net = FeatureNetVGG16() if arch == 'vgg16' else FeatureNetResNet(arch)
         self.region_proposal_network = RegionProposalNetwork(num_anchors,
                                                              self.feature_net.get_out_channels())
-        self.preprocess_head = PreprocessHead(anchor_boxes, img_shape=img_shape)
+        self.preprocess_head = PreprocessHead()
         self.head = HeadVGG16(num_classes) if arch == 'vgg16' else HeadResNet(num_classes, arch)
         self.training_proposal_selector = TrainingProposalSelector()
 
@@ -344,7 +352,8 @@ class FasterRCNN(nn.Module):
 
         pred_loc, pred_obj = self.region_proposal_network(x)
         with torch.no_grad():
-            pred_roi_boxes, pred_roi_batch_idx = self.preprocess_head(pred_loc, pred_obj)
+            pred_roi_boxes, pred_roi_batch_idx = self.preprocess_head(
+                pred_loc, pred_obj, input_shape, self.feature_net.get_sub_sample())
             if self.training:
                 pred_roi_boxes, pred_roi_batch_idx, pred_roi_cls_labels, pred_roi_loc_labels \
                     = self.training_proposal_selector(pred_roi_boxes, pred_roi_batch_idx,
@@ -374,3 +383,6 @@ class FasterRCNN(nn.Module):
             output['pred_roi_loc_labels'] = pred_roi_loc_labels
 
         return output
+
+    def get_sub_sample(self):
+        return self.feature_net.sub_sample()

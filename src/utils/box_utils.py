@@ -62,8 +62,8 @@ def get_boxes_from_loc_batch(anchor_boxes, loc, img_height, img_width, loc_mean=
     Args:
         anchor_boxes (torch.tensor): Shape (N, 4)
         loc (torch.tensor): Shape (B, N, 4)
-        img_width (int): Image width
         img_height (int): Image height
+        img_width (int): Image width
         loc_mean (torch.tensor, optional): Shape (4,). Used to un-normalize loc.
         loc_std (torch.tensor, optional): Shape (4,). Used to un-normalize loc.
 
@@ -93,14 +93,14 @@ def get_boxes_from_loc_batch(anchor_boxes, loc, img_height, img_width, loc_mean=
     return boxes
 
 
-def get_boxes_from_loc_multiclass(anchor_boxes, loc, img_width, img_height, loc_mean=None, loc_std=None):
+def get_boxes_from_loc_multiclass(anchor_boxes, loc, img_height, img_width, loc_mean=None, loc_std=None):
     """ Convert loc predictions to bounding boxes for loc predictions applied to multiple loc predictions.
 
     Args:
         anchor_boxes (np.array or torch.tensor): Shape (N, 4)
         loc (np.array or torch.tensor): Shape (N, C, 4)
-        img_width (int): Image width used to clamp results
         img_height (int): Image height used to clamp final result
+        img_width (int): Image width used to clamp results
         loc_mean (np.array or torch.tensor, optional): Shape (4,). Used to un-normalize loc.
         loc_std (np.array or torch.tensor, optional): Shape (4,). Used to un-normalize loc.
 
@@ -127,14 +127,14 @@ def get_boxes_from_loc_multiclass(anchor_boxes, loc, img_width, img_height, loc_
     return boxes.reshape(*loc.shape)
 
 
-def get_boxes_from_loc(anchor_boxes, loc, img_width, img_height, loc_mean=None, loc_std=None):
+def get_boxes_from_loc(anchor_boxes, loc, img_height, img_width, loc_mean=None, loc_std=None):
     """ Convert loc predictions to bounding boxes.
 
     Args:
         anchor_boxes (np.ndarray): Shape (N, 4)
         loc (np.ndarray): Shape (N, 4)
-        img_width (int): Image width used to clamp results
         img_height (int): Image height used to clamp final result
+        img_width (int): Image width used to clamp results
         loc_mean (np.ndarray, optional): Shape (4,). Used to un-normalize loc.
         loc_std (np.ndarray, optional): Shape (4,). Used to un-normalize loc.
 
@@ -158,27 +158,6 @@ def get_boxes_from_loc(anchor_boxes, loc, img_width, img_height, loc_mean=None, 
     boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, img_height - 1)
 
     return boxes
-
-
-def define_anchor_boxes(sub_sample, height, width):
-    feature_map_w, feature_map_h = (width // sub_sample), (height // sub_sample)
-
-    # using np.array
-    ratios = np.array((2, 1, 0.5), dtype=np.float32).reshape(-1, 1)
-    anchor_scales = np.array((8, 16, 32), dtype=np.float32).reshape(1, -1)
-    anchor_base_x = (sub_sample * anchor_scales * np.sqrt(ratios) / 2).reshape(1, -1, 1, 1)
-    anchor_base_y = (sub_sample * anchor_scales * np.sqrt(1.0 / ratios) / 2).reshape(1, -1, 1, 1)
-    ctr_x, ctr_y = np.meshgrid(
-        sub_sample // 2 + sub_sample * np.arange(feature_map_w, dtype=np.float32),
-        sub_sample // 2 + sub_sample * np.arange(feature_map_h, dtype=np.float32))
-    ctr_x = ctr_x.reshape(-1, 1, 1, 1)
-    ctr_y = ctr_y.reshape(-1, 1, 1, 1)
-    neg_pos = np.array([-1.0, 1.0], dtype=np.float32).reshape(1, 1, -1, 1)
-    anchors_x = ctr_x + (anchor_base_x * neg_pos)
-    anchors_y = ctr_y + (anchor_base_y * neg_pos)
-    anchor_boxes = np.concatenate((anchors_x, anchors_y), axis=3).reshape(-1, 4)
-
-    return anchor_boxes
 
 
 def get_boxes_from_output(output, resized_shapes, orig_shapes, score_thresh=0.05, nms_thresh=0.3):
@@ -206,7 +185,7 @@ def get_boxes_from_output(output, resized_shapes, orig_shapes, score_thresh=0.05
 
         # apply pred_roi_loc corrections to pred_roi_boxes
         pred_result_boxes = get_boxes_from_loc_multiclass(
-            pred_roi_boxes, pred_roi_loc, img_width, img_height,
+            pred_roi_boxes, pred_roi_loc, img_height, img_width,
             loc_mean=np.array((0.0, 0.0, 0.0, 0.0), dtype=pred_roi_loc.dtype),
             loc_std=np.array((0.1, 0.1, 0.2, 0.2), dtype=pred_roi_loc.dtype))
 
@@ -231,8 +210,8 @@ def get_boxes_from_output(output, resized_shapes, orig_shapes, score_thresh=0.05
     return final_preds, batch_indices
 
 
-def get_anchor_labels(anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh,
-                      neg_iou_thresh, pos_ratio, num_samples, mark_max_gt_anchors):
+def select_roi_indices(anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh, neg_iou_thresh,
+                       pos_ratio, num_samples, mark_max_gt_anchors):
     if gt_boxes.size != 0:
         iou = compute_iou(anchor_boxes, gt_boxes)
 
@@ -268,8 +247,63 @@ def get_anchor_labels(anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh,
         anchor_positive_class_labels = np.zeros((0,), dtype=np.int32)
         anchor_positive_loc_labels = np.zeros((0, 4), dtype=np.float32)
 
-    return anchor_positive_index, anchor_negative_index, \
-        anchor_positive_class_labels, anchor_positive_loc_labels
+    return anchor_positive_index, anchor_negative_index, anchor_positive_class_labels, anchor_positive_loc_labels
+
+
+def create_anchor_boxes(height, width, sub_sample=16):
+    feature_map_w, feature_map_h = (width // sub_sample), (height // sub_sample)
+
+    # using np.array
+    ratios = np.array((2, 1, 0.5), dtype=np.float32).reshape(-1, 1)
+    anchor_scales = np.array((8, 16, 32), dtype=np.float32).reshape(1, -1)
+    anchor_base_x = (sub_sample * anchor_scales * np.sqrt(ratios) / 2).reshape(1, -1, 1, 1)
+    anchor_base_y = (sub_sample * anchor_scales * np.sqrt(1.0 / ratios) / 2).reshape(1, -1, 1, 1)
+    ctr_x, ctr_y = np.meshgrid(
+        sub_sample // 2 + sub_sample * np.arange(feature_map_w, dtype=np.float32),
+        sub_sample // 2 + sub_sample * np.arange(feature_map_h, dtype=np.float32))
+    ctr_x = ctr_x.reshape(-1, 1, 1, 1)
+    ctr_y = ctr_y.reshape(-1, 1, 1, 1)
+    neg_pos = np.array([-1.0, 1.0], dtype=np.float32).reshape(1, 1, -1, 1)
+    anchors_x = ctr_x + (anchor_base_x * neg_pos)
+    anchors_y = ctr_y + (anchor_base_y * neg_pos)
+    anchor_boxes = np.concatenate((anchors_x, anchors_y), axis=3).reshape(-1, 4)
+
+    return anchor_boxes
+
+
+def create_rpn_targets(input_shape, valid_shape, gt_boxes, gt_class_labels, sub_sample=16, pos_iou_thresh=0.7,
+                       neg_iou_thresh=0.3, pos_ratio=0.5, num_samples=256, mark_max_gt_anchors=True):
+    input_height, input_width = input_shape
+    valid_height, valid_width = valid_shape
+
+    anchor_boxes = create_anchor_boxes(input_height, input_width, sub_sample)
+    num_anchors = anchor_boxes.shape[0]
+
+    valid_anchor_indices = np.nonzero(
+        np.concatenate((anchor_boxes[:, :2] >= 0,
+                        anchor_boxes[:, 2:3] <= valid_width - 1,
+                        anchor_boxes[:, 3:4] <= valid_height - 1),
+                       axis=1).all(axis=1))[0]
+
+    valid_anchor_boxes = anchor_boxes[valid_anchor_indices, :]
+
+    # randomly select num_samples anchors to score against try to choose pos/neg ratio of pos_ratio
+    valid_positive_indices, valid_negative_indices, positive_class, positive_loc = \
+        select_roi_indices(valid_anchor_boxes, gt_boxes, gt_class_labels, pos_iou_thresh,
+                           neg_iou_thresh, pos_ratio, num_samples, mark_max_gt_anchors)
+
+    positive_indices = valid_anchor_indices[valid_positive_indices]
+    negative_indices = valid_anchor_indices[valid_negative_indices]
+
+    # construct final labels
+    rpn_obj_label = np.full((num_anchors,), -1, dtype=np.int64)
+    rpn_obj_label[positive_indices] = 1
+    rpn_obj_label[negative_indices] = 0
+
+    rpn_loc_label = np.zeros((num_anchors, 4), dtype=np.float32)
+    rpn_loc_label[positive_indices] = positive_loc
+
+    return rpn_obj_label, rpn_loc_label
 
 
 def get_display_pred_boxes(output, resized_shapes, orig_shapes, id_to_name_map, batch_idx=0, top3=False):
