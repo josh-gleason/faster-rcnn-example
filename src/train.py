@@ -131,15 +131,6 @@ def load_datasets(min_shape=(600, 600), max_shape=(1000, 1000), sub_sample=16, c
     else:
         raise ValueError
 
-    # print("DONT LEAVE THIS!!!")
-    # r = np.random.choice(np.arange(len(train_dataset)), 100, replace=False)
-    # train_dataset = torch.utils.data.Subset(train_dataset, r)
-    # r = np.random.choice(np.arange(len(val_dataset)), 100, replace=False)
-    # val_dataset = torch.utils.data.Subset(val_dataset, r)
-
-    from utils.debug import debug_dataset_view
-    debug_dataset_view(train_dataset, coco_id_to_name)
-
     train_sampler = torch.utils.data.RandomSampler(train_dataset)
 
     train_loader = torch.utils.data.DataLoader(
