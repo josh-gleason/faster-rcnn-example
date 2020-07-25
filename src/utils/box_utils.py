@@ -274,9 +274,12 @@ def create_anchor_boxes(height, width, sub_sample=16, ceil_mode=False):
     anchor_scales = np.array((8, 16, 32), dtype=np.float32).reshape(1, -1)
     anchor_base_x = (sub_sample * anchor_scales * np.sqrt(ratios) / 2).reshape(1, -1, 1, 1)
     anchor_base_y = (sub_sample * anchor_scales * np.sqrt(1.0 / ratios) / 2).reshape(1, -1, 1, 1)
-    ctr_x, ctr_y = np.meshgrid(
+    # this order matters and is correct, see test_permute to see it matches permute used in the RegionProposalNetwork
+    ctr_y, ctr_x = np.meshgrid(
+        sub_sample // 2 + sub_sample * np.arange(feature_map_h, dtype=np.float32),
         sub_sample // 2 + sub_sample * np.arange(feature_map_w, dtype=np.float32),
-        sub_sample // 2 + sub_sample * np.arange(feature_map_h, dtype=np.float32))
+        indexing='ij'
+    )
     ctr_x = ctr_x.reshape(-1, 1, 1, 1)
     ctr_y = ctr_y.reshape(-1, 1, 1, 1)
     neg_pos = np.array([-1.0, 1.0], dtype=np.float32).reshape(1, 1, -1, 1)
@@ -377,3 +380,36 @@ def get_display_gt_boxes(gt_boxes, gt_class_labels, resized_shapes, orig_shapes,
     rect_list_gt = rect_list_gt.astype(np.int32).tolist()
 
     return rect_list_gt, text_list_gt
+
+
+def test_permute():
+    # test anchor boxes to make sure order corresponds with real feature coords
+    height, width = 224, 224
+    spatial_sub_sample = 16
+    num_anchors = 9
+    boxes = create_anchor_boxes(height, width, spatial_sub_sample, ceil_mode=True)
+    center_xy = ((boxes[:, :2] + boxes[:, 2:]) * 0.5)
+
+    feat_height = int(np.ceil(height / spatial_sub_sample))
+    feat_width = int(np.ceil(width / spatial_sub_sample))
+
+    ctr_x = center_xy[:, 0]
+    ctr_y = center_xy[:, 1]
+
+    y = torch.zeros((1, num_anchors * 4, feat_height, feat_width), dtype=torch.float32)
+    x = torch.zeros((1, num_anchors * 4, feat_height, feat_width), dtype=torch.float32)
+    for idx, yy in enumerate(np.linspace(0, height, feat_height * 2 + 1)[1::2]):
+        y[:, :, idx, :] = yy
+    for idx, xx in enumerate(np.linspace(0, width, feat_width * 2 + 1)[1::2]):
+        x[:, :, :, idx] = xx
+
+    y = y.permute(0, 2, 3, 1).reshape(y.shape[0], -1, 4)
+    x = x.permute(0, 2, 3, 1).reshape(x.shape[0], -1, 4)
+
+    assert (x - ctr_x[None, :, None]).abs().mean() < 1e-5
+    assert (y - ctr_y[None, :, None]).abs().mean() < 1e-5
+    print("test_permute PASSED")
+
+
+if __name__ == "__main__":
+    test_permute()
