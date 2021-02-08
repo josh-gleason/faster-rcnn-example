@@ -21,7 +21,7 @@ google-auth-oauthlib==0.4.1
 google-reauth==0.1.0
 grpcio==1.30.0
 gsutil==4.52
-httplib2==0.18.1
+httplib2==0.19.0
 idna==2.10
 imageio==2.9.0
 importlib-metadata==1.7.0
