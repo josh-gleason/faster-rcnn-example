@@ -74,7 +74,7 @@ tensorboard==2.2.2
 tensorboard-plugin-wit==1.7.0
 termcolor==1.1.0
 tifffile==2020.7.4
-torch==1.5.1
+torch==2.8.0
 torchfile==0.1.0
 torchnet @ git+https://github.com/pytorch/tnt.git@32ab2bcb3851adab079123f2e8584bb307e04fd5
 torchvision==0.6.1
