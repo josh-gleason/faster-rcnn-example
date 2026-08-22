@@ -50,7 +50,7 @@ pprint==0.1
 prompt-toolkit==3.0.5
 protobuf==3.12.2
 ptyprocess==0.6.0
-pyasn1==0.4.8
+pyasn1==0.6.4
 pyasn1-modules==0.2.8
 pycocotools==2.0.1
 pycparser==2.20
