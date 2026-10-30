@@ -78,7 +78,7 @@ torch==1.5.1
 torchfile==0.1.0
 torchnet @ git+https://github.com/pytorch/tnt.git@32ab2bcb3851adab079123f2e8584bb307e04fd5
 torchvision==0.6.1
-tornado==6.0.4
+tornado==6.6
 tqdm==4.48.0
 traitlets==4.3.3
 urllib3==1.25.9
